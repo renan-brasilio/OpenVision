@@ -131,10 +131,10 @@ struct GlowingOrbButton: View {
         .onAppear {
             startAnimations()
         }
-        .onChange(of: isActive) { _ in
+        .onChange(of: isActive) {
             startAnimations()
         }
-        .onChange(of: isProcessing) { _ in
+        .onChange(of: isProcessing) {
             startAnimations()
         }
     }
@@ -204,7 +204,7 @@ struct WaveformVisualizer: View {
         .onAppear {
             startAnimation()
         }
-        .onChange(of: isActive) { _ in
+        .onChange(of: isActive) {
             startAnimation()
         }
     }

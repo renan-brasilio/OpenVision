@@ -94,6 +94,12 @@ struct GlassesSettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
+                        HStack {
+                            Text("Link State")
+                            Spacer()
+                            Text(glassesManager.deviceLinkState.capitalized)
+                                .foregroundColor(glassesManager.deviceLinkState.lowercased().contains("connected") ? .green : .orange)
+                        }
 
                     HStack {
                         Text("Streaming")

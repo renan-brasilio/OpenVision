@@ -4,7 +4,6 @@
 
 import Foundation
 import Combine
-import UIKit
 
 /// Manages app settings with JSON persistence and debounced saving
 @MainActor
@@ -39,12 +38,6 @@ final class SettingsManager: ObservableObject {
     private var secretsKeptInFile: Set<String> = []
     /// Unreadable secrets the user reset: deleted, not restored, once the Keychain can be read.
     private var secretsToClear: Set<String> = []
-    /// Cleared secrets whose Keychain delete failed. Kept across launches, so a value still in
-    /// the Keychain isn't loaded back; the delete is retried on every save until it succeeds.
-    private var pendingDeletions = Set(UserDefaults.standard.stringArray(forKey: SettingsManager.pendingDeletionsKey) ?? []) {
-        didSet { UserDefaults.standard.set(Array(pendingDeletions), forKey: Self.pendingDeletionsKey) }
-    }
-    private static let pendingDeletionsKey = "SettingsSecrets.pendingDeletions"
 
     // MARK: - Callbacks
 
@@ -60,14 +53,8 @@ final class SettingsManager: ObservableObject {
 
         // Load existing settings or create defaults, then the secrets from the Keychain
         let fileSettings = Self.loadSettings(from: settingsURL)
-        for account in pendingDeletions where SettingsSecrets.write("", account: account) {
-            pendingDeletions.remove(account)
-        }
         var keychain: [String: SettingsSecrets.Stored] = [:]
-        for (account, _) in SettingsSecrets.fields {
-            // A key the user cleared stays cleared, even if the Keychain still has it.
-            keychain[account] = pendingDeletions.contains(account) ? .none : SettingsSecrets.read(account)
-        }
+        for (account, _) in SettingsSecrets.fields { keychain[account] = SettingsSecrets.read(account) }
         let merged = SettingsSecrets.merge(file: fileSettings, keychain: keychain)
         settings = merged.settings
         unreadableSecrets = merged.unreadable
@@ -80,41 +67,6 @@ final class SettingsManager: ObservableObject {
             print("[SettingsManager] Moving API keys from settings.json to the Keychain")
             saveNow()
         }
-
-        // A launch before first unlock (Bluetooth relaunch after a reboot) can't read the
-        // Keychain: load the keys as soon as it can, without waiting for a settings change.
-        let center = NotificationCenter.default
-        for name in [UIApplication.protectedDataDidBecomeAvailableNotification, UIApplication.didBecomeActiveNotification] {
-            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.reloadUnreadableSecrets() }
-            }
-        }
-    }
-
-    /// Read again the secrets the Keychain couldn't give us at launch, and put them back into
-    /// `settings` so the backends see them (the change saves and fires `onSettingsChanged`).
-    func reloadUnreadableSecrets() {
-        guard !unreadableSecrets.isEmpty else { return }
-        var resetWhileLocked = false
-        for (account, keyPath) in SettingsSecrets.fields where unreadableSecrets.contains(account) {
-            switch SettingsSecrets.read(account) {
-            case .unreadable:
-                continue
-            case .value(let stored):
-                storedSecrets[account] = stored
-                if secretsToClear.contains(account) {
-                    resetWhileLocked = true   // the save below deletes it
-                } else if settings[keyPath: keyPath].isEmpty {
-                    settings[keyPath: keyPath] = stored
-                }
-            case .none:
-                break
-            }
-            unreadableSecrets.remove(account)
-            secretsToClear.remove(account)
-        }
-        print("[SettingsManager] Reloaded Keychain secrets; \(unreadableSecrets.count) still unreadable")
-        if resetWhileLocked { scheduleSave() }
     }
 
     // MARK: - Public Methods
@@ -162,7 +114,7 @@ final class SettingsManager: ObservableObject {
             let seconds = self?.debounceInterval ?? 0.5
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard !Task.isCancelled else { return }
-            await self?.performSave()
+            self?.performSave()
             self?.onSettingsChanged?(self?.settings ?? AppSettings())
         }
     }
@@ -186,12 +138,26 @@ final class SettingsManager: ObservableObject {
 
     /// Write the secrets that changed to the Keychain.
     private func saveSecrets() {
-        // Try again first: the phone may have been unlocked since launch.
-        reloadUnreadableSecrets()
-        for (account, keyPath) in SettingsSecrets.fields where !unreadableSecrets.contains(account) {
+        for (account, keyPath) in SettingsSecrets.fields {
+            if unreadableSecrets.contains(account) {
+                // Try again: the phone may have been unlocked since launch.
+                switch SettingsSecrets.read(account) {
+                case .unreadable:
+                    continue
+                case .value(let stored):
+                    storedSecrets[account] = stored
+                    // Reset since launch: the write below deletes it instead.
+                    if settings[keyPath: keyPath].isEmpty && !secretsToClear.contains(account) {
+                        settings[keyPath: keyPath] = stored
+                    }
+                case .none:
+                    break
+                }
+                unreadableSecrets.remove(account)
+                secretsToClear.remove(account)
+            }
             let value = settings[keyPath: keyPath]
-            let retryDelete = value.isEmpty && pendingDeletions.contains(account)
-            guard storedSecrets[account, default: ""] != value || retryDelete else {
+            guard storedSecrets[account, default: ""] != value else {
                 // The Keychain already has it (e.g. changed back after a failed write).
                 secretsKeptInFile.remove(account)
                 continue
@@ -199,9 +165,6 @@ final class SettingsManager: ObservableObject {
             if SettingsSecrets.write(value, account: account) {
                 storedSecrets[account] = value
                 secretsKeptInFile.remove(account)
-                if pendingDeletions.contains(account) { pendingDeletions.remove(account) }
-            } else if value.isEmpty {
-                pendingDeletions.insert(account)   // retried, and never loaded back meanwhile
             } else {
                 secretsKeptInFile.insert(account)
             }

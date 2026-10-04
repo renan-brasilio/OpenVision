@@ -5,6 +5,27 @@ All notable changes to OpenVision will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Thinking Sound** — an independent, opt-in toggle under Settings → Voice Control → Feedback. A quiet loop follows the active audio route while the AI thinks or runs tools, stops for speech and terminal processing/lifecycle transitions, and cancels pending starts when disabled. Playback runs on the existing background audio executor to avoid implicit audio-session activation on the UI thread.
+
+### Fixed
+- Thinking playback is paused and drained before glasses camera access, and resumes only after the Meta device session confirms shutdown. Camera cleanup is shared across concurrent stops and completes even for canceled callers, without rebuilding the photo-mode microphone engine.
+- The existing camera-link readiness wait now follows Meta AI permission approval and includes OpenVision's return to the foreground.
+- Photo capture timestamps the first frame before returning from camera startup and waits six seconds for it. The production transaction no longer clears a frame that arrived during startup or times out after 2.5 seconds.
+- Wake-word recognition survives leaving the Voice tab and entering the background. The audio session stays active, and returning to the foreground restarts recognition if iOS interrupted it.
+- Audio-session hardware configuration now runs asynchronously on a dedicated serial executor instead of blocking the main actor with `DispatchQueue.sync`. Recognition and live-audio engines start only after routing completes; canceled lifecycles cannot restart stale audio taps.
+- Local-model inputs and images are constructed inside `ModelContainer.perform`, removing the unsafe retroactive `UserInput` Sendable conformance. Location and geocoding continuation state are main-actor confined, with exactly-once completion across timeout and late callbacks.
+- Reverse geocoding uses MapKit on iOS 26 and later, retaining the CoreLocation implementation for iOS 18–25 and the existing three-second bound.
+- MLX package identities are unified through the PrismML fork and the shared SwiftPM mirror. Misaki explicitly declares `MLXRandom`; vendored ZIPFoundation preserves its source and license while removing deprecated platform and Swift-version manifest declarations.
+- Deprecated MLX cache-clearing and SwiftUI `onChange` APIs, redundant awaits, and unsafe download-progress captures are replaced with their supported equivalents.
+- Regenerating the Xcode project preserves the intended disabled Metal API Validation setting for MLX.
+
+### Known limitations
+- Four upstream MLX Metal `if constexpr` extension warnings remain; GPU kernels and compiler diagnostics are not altered to hide them ([upstream issue #342](https://github.com/ml-explore/mlx-swift/issues/342)).
+- The device test run records internal QoS priority-inversion diagnostics in `CloudTTSFallbackTests`. These diagnostics remain enabled; passing tests do not establish that every speech-runtime warning is resolved.
+
 ## [2.14.0] - 2026-10-02
 
 ### Added

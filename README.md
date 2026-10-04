@@ -14,7 +14,6 @@
 [![Swift 5](https://img.shields.io/badge/Swift-5-orange.svg)](https://swift.org)
 [![iOS 18+](https://img.shields.io/badge/iOS-18+-blue.svg)](https://developer.apple.com/ios/)
 [![Latest release](https://img.shields.io/github/v/release/rayl15/OpenVision?color=2ea44f)](https://github.com/rayl15/OpenVision/releases)
-[![CI](https://github.com/rayl15/OpenVision/actions/workflows/ci.yml/badge.svg)](https://github.com/rayl15/OpenVision/actions/workflows/ci.yml)
 [![Stars](https://img.shields.io/github/stars/rayl15/OpenVision?logo=github)](https://github.com/rayl15/OpenVision/stargazers)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/rayl15/OpenVision/blob/main/CONTRIBUTING.md)
 [![good first issues](https://img.shields.io/github/issues/rayl15/OpenVision/good%20first%20issue?color=7057ff&label=good%20first%20issues)](https://github.com/rayl15/OpenVision/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
@@ -314,6 +313,16 @@ You: "Ok Vision, take a photo and tell me what this is"
 | "Yes" / "No" | Answer when Hermes asks before a risky command |
 
 > Commands are routed by the on-device model, so you don't need exact wording — natural phrasing works, and it searches the web on its own when it doesn't know.
+
+### Audio Feedback
+
+In **Settings → Voice Control → Feedback**, enable **Thinking Sound** for a quiet background loop while the AI is thinking or running a tool. It follows the active audio output, including the glasses when connected, and stops for spoken replies, when processing ends, on Stop, or when leaving the voice screen.
+
+The loop pauses before photo capture or live camera streaming and resumes only after the camera session has shut down, if the AI is still thinking. Photo capture leaves the existing glasses microphone engine intact.
+
+Thinking Sound is **off by default**, saves automatically, and is independent of **Activation Sound**. Turning it off also stops any active loop.
+
+After opening OpenVision once, wake-word listening continues while you use another app or lock the screen, as long as Meta AI remains running and iOS does not suspend the audio session. Opening Settings or History no longer stops listening.
 
 ---
 

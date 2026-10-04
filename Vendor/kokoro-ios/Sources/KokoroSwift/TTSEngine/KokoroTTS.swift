@@ -236,7 +236,7 @@ public final class KokoroTTS {
     MLX.eval(audio)
     
     // Clear Metal cache to free unused buffers
-    GPU.clearCache()
+    Memory.clearCache()
     
     return (outputAudio, tokenArray)
   }

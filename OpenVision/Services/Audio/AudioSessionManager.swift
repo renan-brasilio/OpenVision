@@ -3,9 +3,9 @@
 
 import AVFoundation
 
-/// Manages audio session configuration
-@MainActor
-final class AudioSessionManager {
+/// Runs complete hardware configurations on a serial background executor. Callers await the
+/// actor hop instead of blocking the main actor with DispatchQueue.sync.
+actor AudioSessionManager {
     // MARK: - Singleton
 
     static let shared = AudioSessionManager()
@@ -13,13 +13,21 @@ final class AudioSessionManager {
     // MARK: - Properties
 
     private let audioSession = AVAudioSession.sharedInstance()
+    private var thinkingPlayer: AVAudioPlayer?
+    private var hasPreparedThinkingSound = false
+
+    private nonisolated let executor = AudioSessionExecutor()
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
 
     /// Current audio mode
     private(set) var currentMode: AudioMode = .inactive
 
     // MARK: - Audio Modes
 
-    enum AudioMode {
+    enum AudioMode: Sendable {
         /// No audio session active
         case inactive
 
@@ -66,7 +74,6 @@ final class AudioSessionManager {
         try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         currentMode = .inactive
     }
-
     // MARK: - Mode Configurations
 
     /// Configure for voice chat (iPhone mic, aggressive AEC)
@@ -113,7 +120,6 @@ final class AudioSessionManager {
         )
         try audioSession.setActive(true)
     }
-
     // MARK: - Bluetooth HFP Routing
 
     /// Configure the audio session for the glasses' Bluetooth HFP mic + speaker.
@@ -124,10 +130,6 @@ final class AudioSessionManager {
     /// (this is what previously made the glasses mic undetectable: the phone route disallows HFP).
     @discardableResult
     func configureForGlasses() throws -> Bool {
-        // Match OpenGlasses: `.default` mode + `.mixWithOthers` so the recognizer's session COEXISTS
-        // with the glasses camera's Bluetooth stream instead of taking exclusive HFP control. With
-        // `.voiceChat` + `.duckOthers` the camera stream killed the HFP mic (and iOS wouldn't revive
-        // it); `.mixWithOthers` keeps the glasses mic alive through photo capture.
         try audioSession.setCategory(
             .playAndRecord,
             mode: .default,
@@ -135,14 +137,13 @@ final class AudioSessionManager {
         )
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
 
-        // Now that HFP is allowed + the session is active, the glasses mic should be listed.
         guard let hfpInput = findBluetoothHFPInput() else {
             print("[AudioSession] No Bluetooth HFP input — glasses not connected as an audio device. Inputs: \(availableInputsDescription)")
             return false
         }
         try audioSession.setPreferredInput(hfpInput)
         currentMode = .voiceChat
-        print("[AudioSession] ✓ Configured for glasses (Bluetooth HFP): \(hfpInput.portName) — route: \(currentRouteDescription)")
+        print("[AudioSession] ✓ Configured for glasses (Bluetooth HFP)")
         return true
     }
 
@@ -162,13 +163,20 @@ final class AudioSessionManager {
             options: [.defaultToSpeaker, .allowBluetoothA2DP]
         )
         try audioSession.setActive(true)
-        // If still routed to the quiet earpiece (carried over from a glasses/voiceChat config),
-        // force the loud speaker — but leave AirPods / headphones alone if they're connected.
         if audioSession.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver }) {
             try? audioSession.overrideOutputAudioPort(.speaker)
         }
         currentMode = .voiceChat
         print("[AudioSession] Configured for phone (built-in mic + loud speaker)")
+    }
+
+    func maintainBackgroundAudio() throws {
+        try audioSession.setCategory(
+            .playAndRecord,
+            mode: .default,
+            options: [.mixWithOthers, .allowBluetoothHFP, .allowBluetoothA2DP, .defaultToSpeaker]
+        )
+        try audioSession.setActive(true)
     }
 
     /// Find Bluetooth HFP input port
@@ -199,6 +207,40 @@ final class AudioSessionManager {
         return "Input: \(inputs.isEmpty ? "none" : inputs), Output: \(outputs.isEmpty ? "none" : outputs)"
     }
 
+    // MARK: - Thinking Feedback
+
+    /// AVAudioPlayer can implicitly activate the session; keep preparation and playback off UI.
+    func startThinkingSound() {
+        guard !Task.isCancelled else { return }
+        if !hasPreparedThinkingSound {
+            hasPreparedThinkingSound = true
+            if let url = Bundle.main.url(forResource: "thinking_loop", withExtension: "mp3") {
+                do {
+                    let player = try AVAudioPlayer(contentsOf: url)
+                    player.numberOfLoops = -1
+                    player.volume = 0.18
+                    player.prepareToPlay()
+                    thinkingPlayer = player
+                } catch {
+                    print("[SoundService] Unable to prepare thinking sound: \(error)")
+                }
+            }
+        }
+        guard !Task.isCancelled, let player = thinkingPlayer, !player.isPlaying else { return }
+        player.currentTime = 0
+        if !player.play() {
+            print("[SoundService] Unable to start thinking sound")
+        }
+        if Task.isCancelled { stopThinkingSound() }
+    }
+
+    func stopThinkingSound() {
+        thinkingPlayer?.stop()
+        thinkingPlayer?.currentTime = 0
+    }
+
+    var isPlayingThinkingSound: Bool { thinkingPlayer?.isPlaying == true }
+
     // MARK: - Utilities
 
     /// Get current input sample rate
@@ -222,6 +264,20 @@ final class AudioSessionManager {
     var isUsingBuiltInMic: Bool {
         audioSession.currentRoute.inputs.contains { port in
             port.portType == .builtInMic
+        }
+    }
+}
+
+/// AVAudioSession setters can wait for hardware; keep that wait off both the UI thread and
+/// Swift's cooperative thread pool without allowing two configurations to interleave.
+private final class AudioSessionExecutor: SerialExecutor {
+    private let queue = DispatchQueue(label: "com.openvision.audioSession", qos: .userInitiated)
+
+    func enqueue(_ job: consuming ExecutorJob) {
+        let job = UnownedJob(job)
+        let executor = asUnownedSerialExecutor()
+        queue.async {
+            job.runSynchronously(on: executor)
         }
     }
 }

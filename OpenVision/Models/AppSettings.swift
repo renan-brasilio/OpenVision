@@ -158,6 +158,46 @@ enum TTSEngineType: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Supported language for speech recognition
+enum SpeechLanguage: String, Codable, CaseIterable, Identifiable {
+    case portugueseBR = "pt-BR"
+    case portuguesePT = "pt-PT"
+    case englishUS = "en-US"
+    case deviceDefault = "auto"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .portugueseBR: return "Português (Brasil)"
+        case .portuguesePT: return "Português (Portugal)"
+        case .englishUS: return "English (US)"
+        case .deviceDefault: return "System Default"
+        }
+    }
+
+    var localeIdentifier: String {
+        switch self {
+        case .deviceDefault:
+            let id = Locale.autoupdatingCurrent.identifier.replacingOccurrences(of: "_", with: "-")
+            return id.isEmpty ? "pt-BR" : id
+        default:
+            return rawValue
+        }
+    }
+
+    var isPortuguese: Bool {
+        switch self {
+        case .portugueseBR, .portuguesePT:
+            return true
+        case .deviceDefault:
+            return Locale.autoupdatingCurrent.language.languageCode?.identifier == "pt"
+        case .englishUS:
+            return false
+        }
+    }
+}
+
 /// App settings persisted to Documents/settings.json (API keys and tokens go to the Keychain; see SettingsSecrets)
 struct AppSettings: Codable, Equatable {
     // MARK: - AI Backend Selection
@@ -258,6 +298,9 @@ struct AppSettings: Codable, Equatable {
 
     // MARK: - Voice Settings
 
+    /// Speech recognition language (default: Brazilian Portuguese)
+    var speechLanguage: SpeechLanguage = .portugueseBR
+
     /// Wake word phrase (default: "Ok Vision")
     var wakeWord: String = "Ok Vision"
 
@@ -266,6 +309,9 @@ struct AppSettings: Codable, Equatable {
 
     /// Play activation chime on wake word detection
     var playActivationSound: Bool = true
+
+    /// Quiet background loop while waiting for an AI reply; independent of the wake-word chime.
+    var playThinkingSound: Bool = false
 
     /// Conversation timeout in seconds (auto-end after silence)
     var conversationTimeout: TimeInterval = 30

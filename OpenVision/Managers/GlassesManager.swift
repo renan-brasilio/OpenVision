@@ -26,6 +26,9 @@ final class GlassesManager: ObservableObject {
     /// Number of connected devices
     @Published var connectedDeviceCount: Int = 0
 
+    /// Current link state of the active device ("connected", "connecting", "disconnected")
+    @Published var deviceLinkState: String = "Unknown"
+
     /// Whether camera streaming is active
     @Published var isStreaming: Bool = false
 
@@ -49,6 +52,7 @@ final class GlassesManager: ObservableObject {
     // hardware, camera.stream carries frames. Stopping the camera cascades to the stream.
     private var deviceSession: DeviceSession?
     private var camera: Camera?
+    private var cameraStopTask: Task<Void, Never>?
 
     // Listener tokens (retained to keep subscriptions active)
     private var registrationTask: Task<Void, Never>?
@@ -103,10 +107,8 @@ final class GlassesManager: ObservableObject {
     func unregister() async {
         print("[GlassesManager] Starting unregistration")
 
-        // Stop streaming first if active
-        if isStreaming {
-            await stopStreaming()
-        }
+        // Release camera ownership even if the stream has already stopped.
+        await stopStreaming()
 
         do {
             try await wearables.startUnregistration()
@@ -125,6 +127,8 @@ final class GlassesManager: ObservableObject {
 
     /// Start camera streaming from glasses
     func startStreaming() async {
+        await cameraStopTask?.value
+
         guard isRegistered else {
             errorMessage = "Not registered with Meta AI"
             print("[GlassesManager] Cannot start streaming - not registered")
@@ -143,6 +147,12 @@ final class GlassesManager: ObservableObject {
             return
         }
 
+        // The cue's HFP output competes with camera transport. Do not rebuild the mic engine.
+        await SoundService.shared.beginCameraAccess()
+        defer {
+            if deviceSession == nil && !isStreaming { SoundService.shared.endCameraAccess() }
+        }
+
         print("[GlassesManager] Starting camera stream for device: \(deviceId)")
 
         // Diagnostic (issue #55 follow-up): the SDK's own verdict on whether it can drive
@@ -150,36 +160,67 @@ final class GlassesManager: ObservableObject {
         // "Device unavailable" at session start.
         if let device = wearables.deviceForIdentifier(deviceId) {
             print("[GlassesManager] Device \(device.nameOrId()): type=\(device.deviceType()) link=\(device.linkState) compatibility=\(device.compatibility())")
+            self.deviceLinkState = "\(device.linkState)"
             if device.compatibility() == .deviceUpdateRequired {
                 errorMessage = "Glasses firmware update required — update in the Meta AI app"
+                return
             } else if device.compatibility() == .sdkUpdateRequired {
                 errorMessage = "Glasses too new for this SDK version"
+                return
             }
+
         } else {
             print("[GlassesManager] deviceForIdentifier returned nil")
         }
 
-        // Request camera permission first (like xmeta does)
+        // Request camera permission
         do {
-            var status = try await wearables.checkPermissionStatus(.camera)
-            print("[GlassesManager] Camera permission status: \(status)")
+            var status: PermissionStatus = .denied
+            do {
+                status = try await wearables.checkPermissionStatus(.camera)
+                print("[GlassesManager] Camera permission status: \(status)")
+            } catch {
+                print("[GlassesManager] checkPermissionStatus threw: \(error) — requesting permission directly")
+            }
 
             if status != .granted {
-                print("[GlassesManager] Requesting camera permission...")
+                print("[GlassesManager] Requesting camera permission via Meta AI...")
                 status = try await wearables.requestPermission(.camera)
                 print("[GlassesManager] After request, status: \(status)")
             }
 
             guard status == .granted else {
-                errorMessage = "Camera permission denied"
+                errorMessage = "Camera permission denied in Meta AI"
                 print("[GlassesManager] Camera permission not granted")
                 return
             }
         } catch {
-            errorMessage = "Permission error: \(error.localizedDescription)"
+            let desc = error.localizedDescription
+            if desc.contains("powered off or disconnected") {
+                errorMessage = "Glasses link inactive. Keep Meta AI in background, wear the glasses, and try again."
+            } else {
+                errorMessage = "Permission error: \(desc)"
+            }
             print("[GlassesManager] Permission error: \(error)")
             return
         }
+        // Permission approval can switch to Meta AI. Wait after that handoff, not before it.
+        if let device = wearables.deviceForIdentifier(deviceId),
+           device.linkState != .connected || UIApplication.shared.applicationState != .active {
+            print("[GlassesManager] Waiting up to 5s for the camera link and foreground app...")
+            for _ in 0..<10 {
+                do {
+                    try await Task.sleep(nanoseconds: 500_000_000)
+                } catch {
+                    return
+                }
+                deviceLinkState = "\(device.linkState)"
+                if device.linkState == .connected && UIApplication.shared.applicationState == .active {
+                    break
+                }
+            }
+        }
+
 
         // SpecificDeviceSelector stays the more reliable choice over AutoDeviceSelector
         let specificSelector = SpecificDeviceSelector(device: deviceId)
@@ -210,62 +251,70 @@ final class GlassesManager: ObservableObject {
             print("[GlassesManager] Starting device session...")
             try session.start()
 
-            let started = await withTaskGroup(of: Bool.self) { group in
-                group.addTask {
-                    for await state in stateStream {
-                        print("[GlassesManager] Device session state: \(state)")
-                        if state == .started { return true }
-                        if state == .stopped { return false }
-                    }
-                    return false
-                }
-                group.addTask {
-                    try? await Task.sleep(nanoseconds: 15_000_000_000)
-                    return false
-                }
-                let first = await group.next() ?? false
-                group.cancelAll()
-                return first
-            }
+            let started = await waitForSessionState(.started, session: session, states: stateStream)
             guard started else {
                 errorMessage = "Device session did not start (timeout)"
                 print("[GlassesManager] Device session failed to reach .started")
                 dumpSDKLogs(since: 30)
-                session.stop()
-                deviceSession = nil
+                await stopStreaming()
                 return
             }
 
             guard let cam = try session.addCamera(config: config) else {
                 errorMessage = "Failed to attach camera to device session"
                 print("[GlassesManager] addCamera returned nil")
-                session.stop()
-                deviceSession = nil
+                await stopStreaming()
                 return
             }
             camera = cam
 
             setupStreamListeners(stream: cam.stream)
             cam.stream.start()
+            // The first frame can arrive before the caller resumes. Its timestamp, not its later
+            // presence, distinguishes that fresh frame from one captured earlier.
+            lastFrame = nil
+            lastFrameTime = .distantPast
             isStreaming = true
             print("[GlassesManager] Streaming started successfully")
         } catch {
             errorMessage = "Stream start failed: \(error.localizedDescription)"
             print("[GlassesManager] Stream start error: \(error)")
-            cleanupStreamListeners()
-            camera = nil
-            deviceSession = nil
+            await stopStreaming()
         }
     }
 
     /// Stop camera streaming
     func stopStreaming() async {
+        if let cameraStopTask {
+            await cameraStopTask.value
+            return
+        }
         guard isStreaming || camera != nil || deviceSession != nil else { return }
+
+        // Cleanup must finish even when its caller is canceled. Coalesce concurrent stops.
+        let task = Task {
+            await finishStoppingStream()
+            cameraStopTask = nil
+        }
+        cameraStopTask = task
+        await task.value
+    }
+
+    private func finishStoppingStream() async {
 
         print("[GlassesManager] Stopping camera stream")
 
-        camera?.stop()          // cascades to the stream
-        deviceSession?.stop()
+        let session = deviceSession
+        let states = session?.stateStream()   // subscribe before issuing stop
+        camera?.stop()                       // cascades to the stream
+        session?.stop()
+        if let session, let states {
+            guard await waitForSessionState(.stopped, session: session, states: states) else {
+                errorMessage = "Camera session did not stop (timeout)"
+                print("[GlassesManager] Camera session failed to reach .stopped; keeping thinking sound paused")
+                return
+            }
+        }
 
         cleanupStreamListeners()
         camera = nil
@@ -273,6 +322,7 @@ final class GlassesManager: ObservableObject {
         isStreaming = false
         lastFrame = nil
         lastFrameTime = .distantPast
+        SoundService.shared.endCameraAccess()
 
         print("[GlassesManager] Streaming stopped")
     }
@@ -296,6 +346,31 @@ final class GlassesManager: ObservableObject {
 
     // MARK: - Private Methods
 
+    private func waitForSessionState(
+        _ expected: DeviceSessionState,
+        session: DeviceSession,
+        states: AsyncStream<DeviceSessionState>
+    ) async -> Bool {
+        if session.state == expected { return true }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                for await state in states {
+                    print("[GlassesManager] Device session state: \(state)")
+                    if state == expected { return true }
+                    if state == .stopped { return false }
+                }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+    }
+
     private func setupRegistrationListener() {
         registrationTask = Task {
             for await state in wearables.registrationStateStream() {
@@ -318,7 +393,12 @@ final class GlassesManager: ObservableObject {
                 await MainActor.run {
                     self.connectedDeviceCount = devices.count
                     self.connectedDevice = devices.first
-                    print("[GlassesManager] Devices updated: \(devices.count) connected")
+                    if let firstId = devices.first, let dev = self.wearables.deviceForIdentifier(firstId) {
+                        self.deviceLinkState = "\(dev.linkState)"
+                    } else {
+                        self.deviceLinkState = devices.isEmpty ? "None" : "Disconnected"
+                    }
+                    print("[GlassesManager] Devices updated: \(devices.count) connected, link: \(self.deviceLinkState)")
                 }
             }
         }

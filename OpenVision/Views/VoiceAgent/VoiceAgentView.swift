@@ -93,10 +93,10 @@ struct VoiceAgentView: View {
             await viewModel.requestSpeechAuthorization()
         }
         // Observe TTS state changes
-        .onChange(of: ttsService.isSpeaking) { isSpeaking in
+        .onChange(of: ttsService.isSpeaking) { _, isSpeaking in
             viewModel.ttsSpeakingChanged(isSpeaking)
         }
-        .onChange(of: kokoroTTS.isSpeaking) { speaking in
+        .onChange(of: kokoroTTS.isSpeaking) { _, speaking in
             viewModel.neuralSpeakingChanged(speaking)
         }
         .onChange(of: grokTTS.isSpeaking) { _, speaking in
@@ -105,12 +105,8 @@ struct VoiceAgentView: View {
         .onChange(of: openAITTS.isSpeaking) { _, speaking in
             viewModel.neuralSpeakingChanged(speaking)
         }
-        // Control thinking sound based on agent state
-        .onChange(of: viewModel.agentState) { newState in
-            viewModel.agentStateChanged(newState)
-        }
         // Observe VoiceCommandService state changes
-        .onChange(of: voiceCommandService.state) { newState in
+        .onChange(of: voiceCommandService.state) { _, newState in
             viewModel.voiceStateChanged(newState)
         }
     }

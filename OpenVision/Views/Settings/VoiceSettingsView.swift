@@ -50,6 +50,19 @@ struct VoiceSettingsView: View {
 
     var body: some View {
         Form {
+            // Language Section
+            Section {
+                Picker("Speech Language", selection: $settingsManager.settings.speechLanguage) {
+                    ForEach(SpeechLanguage.allCases) { lang in
+                        Text(lang.displayName).tag(lang)
+                    }
+                }
+            } header: {
+                Text("Language")
+            } footer: {
+                Text("Language used for voice recognition and spoken assistant responses.")
+            }
+
             // Wake Word Section
             Section {
                 Toggle(isOn: $settingsManager.settings.wakeWordEnabled) {
@@ -203,6 +216,14 @@ struct VoiceSettingsView: View {
                             .foregroundColor(.secondary)
                     }
                 }
+                Toggle(isOn: $settingsManager.settings.playThinkingSound) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Thinking Sound")
+                        Text("Quiet background sound while AI is working")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
             } header: {
                 Text("Feedback")
             }
@@ -239,12 +260,22 @@ struct VoiceSettingsView: View {
 
     private var samplePhrases: [String] {
         let wake = settingsManager.settings.wakeWord
-        return [
-            "\(wake), what's the weather?",
-            "\(wake), take a photo",
-            "\(wake), remind me to...",
-            "\(wake), search for..."
-        ]
+        if settingsManager.settings.speechLanguage.isPortuguese {
+            return [
+                "\(wake), como está o tempo?",
+                "\(wake), tira uma foto",
+                "\(wake), me lembra de...",
+                "\(wake), pesquisa sobre...",
+                "\(wake), iniciar vídeo"
+            ]
+        } else {
+            return [
+                "\(wake), what's the weather?",
+                "\(wake), take a photo",
+                "\(wake), remind me to...",
+                "\(wake), search for..."
+            ]
+        }
     }
 }
 

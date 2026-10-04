@@ -15,8 +15,8 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/weichsel/ZIPFoundation.git", .upToNextMajor(from: "0.9.0")),
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.29.1")
+        .package(path: "../ZIPFoundation"),
+        .package(url: "https://github.com/PrismML-Eng/mlx-swift.git", from: "0.29.1")
     ],
     targets: [
         .target(

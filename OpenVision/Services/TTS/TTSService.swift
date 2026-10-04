@@ -39,14 +39,19 @@ final class TTSService: NSObject, ObservableObject {
 
     // MARK: - Voice Selection
 
-    private var selectedVoice: AVSpeechSynthesisVoice? { Self.userVoice }
-
-    /// The Apple voice chosen in Settings, or the default English voice. Also used by the cloud
-    /// voices' Apple fallback, so the choice lives in one place.
-    static var userVoice: AVSpeechSynthesisVoice? {
+    private var selectedVoice: AVSpeechSynthesisVoice? {
         // Check if user has selected a specific voice
         if let identifier = SettingsManager.shared.settings.selectedVoiceIdentifier,
            let voice = AVSpeechSynthesisVoice(identifier: identifier) {
+            return voice
+        }
+        // Match the configured speech language
+        let language = SettingsManager.shared.settings.speechLanguage.localeIdentifier
+        if let voice = AVSpeechSynthesisVoice(language: language) {
+            return voice
+        }
+        if SettingsManager.shared.settings.speechLanguage.isPortuguese,
+           let voice = AVSpeechSynthesisVoice(language: "pt-BR") ?? AVSpeechSynthesisVoice(language: "pt-PT") {
             return voice
         }
 
@@ -55,9 +60,10 @@ final class TTSService: NSObject, ObservableObject {
     }
 
     /// Get all available voices for a language
-    static func availableVoices(for languageCode: String = "en") -> [AVSpeechSynthesisVoice] {
+    static func availableVoices(for languageCode: String? = nil) -> [AVSpeechSynthesisVoice] {
+        let code = languageCode ?? (SettingsManager.shared.settings.speechLanguage.isPortuguese ? "pt" : "en")
         return AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language.hasPrefix(languageCode) }
+            .filter { $0.language.hasPrefix(code) }
             .sorted { v1, v2 in
                 // Sort by quality (premium first), then by name
                 if v1.quality != v2.quality {

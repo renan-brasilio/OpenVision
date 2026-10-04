@@ -84,7 +84,19 @@ final class VoiceCommandService: ObservableObject {
 
     // MARK: - Speech Recognition
 
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private var cachedSpeechLocale: String = ""
+    private var _cachedSpeechRecognizer: SFSpeechRecognizer?
+    private var speechRecognizer: SFSpeechRecognizer? {
+        let currentLocale = SettingsManager.shared.settings.speechLanguage.localeIdentifier
+        if _cachedSpeechRecognizer == nil || cachedSpeechLocale != currentLocale {
+            cachedSpeechLocale = currentLocale
+            _cachedSpeechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: currentLocale))
+                ?? SFSpeechRecognizer(locale: Locale(identifier: "pt-BR"))
+                ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+                ?? SFSpeechRecognizer()
+        }
+        return _cachedSpeechRecognizer
+    }
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
 
@@ -291,7 +303,13 @@ final class VoiceCommandService: ObservableObject {
     private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
         request.shouldReportPartialResults = true
         request.taskHint = .search
-        var phrases = ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
+        var phrases = [
+            "Ok Vision", "Okay Vision", "Hey Vision", "Vision",
+            "Tira uma foto", "Tirar foto", "Tire uma foto",
+            "O que você está vendo", "O que é isso",
+            "Iniciar vídeo", "Começar vídeo", "Parar vídeo",
+            "Para", "Parar", "Silêncio", "Chega"
+        ]
         if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
         request.contextualStrings = phrases
     }
@@ -382,8 +400,9 @@ final class VoiceCommandService: ObservableObject {
     }
 
     /// Restart speech recognition to clear buffer
-    private func restartRecognition() {
-        guard isListening else { return }
+    @discardableResult
+    private func restartRecognition() -> Bool {
+        guard isListening else { return false }
 
         // Stop current recognition. Bump the generation FIRST so the canceled task's dying
         // callbacks (delivered async) are orphaned immediately, not just once the new task exists.
@@ -398,12 +417,12 @@ final class VoiceCommandService: ObservableObject {
 
         // Create new recognition request
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest = recognitionRequest else { return }
+        guard let recognitionRequest = recognitionRequest else { return false }
 
         configureRecognitionRequest(recognitionRequest)
 
         // Reinstall tap
-        guard let audioEngine = audioEngine else { return }
+        guard let audioEngine = audioEngine else { return false }
 
         // The glasses camera's Bluetooth route change can silently STOP the running engine (the
         // recognizer then looks alive but hears nothing). Revive the same engine instead of tearing
@@ -428,7 +447,7 @@ final class VoiceCommandService: ObservableObject {
         guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
             print("[VoiceCommand] Input unavailable on reinstall — skipping tap")
             self.recognitionRequest = nil
-            return
+            return false
         }
 
         // Reinstall may follow a route change (phone mic <-> glasses HFP), so the detector's
@@ -443,7 +462,7 @@ final class VoiceCommandService: ObservableObject {
         }) {
             print("[VoiceCommand] installTap (reinstall) failed: \(reason)")
             self.recognitionRequest = nil
-            return
+            return false
         }
 
         // Start new recognition task
@@ -461,6 +480,7 @@ final class VoiceCommandService: ObservableObject {
         // Restart churn is the proxy for recognizer health: a high rate here is what shreds
         // transcripts into fragments like "53258 Okay Vision".
         MetricsCollector.shared.count("recognition_restart")
+        return recognitionTask != nil
     }
 
     /// Exit conversation mode
@@ -539,7 +559,7 @@ final class VoiceCommandService: ObservableObject {
         case .listening, .conversationMode:
             // Strip wake word from transcription (like xmeta does)
             var command = transcription
-            for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision"] {
+            for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision", "ei vision", "oi vision", "olá vision", "ola vision", "ok visão", "okay visão"] {
                 if let range = command.lowercased().range(of: ww) {
                     command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
                     break
@@ -635,8 +655,11 @@ final class VoiceCommandService: ObservableObject {
     private func isStopPhrase(_ text: String) -> Bool {
         guard detectWakeWord(in: text, bypassCooldown: true) else { return false }
         let lower = text.lowercased()
-        if lower.contains("video") || lower.contains("stream") { return false }
-        let stopWords = ["stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel"]
+        if lower.contains("video") || lower.contains("stream") || lower.contains("vídeo") { return false }
+        let stopWords = [
+            "stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel",
+            "para", "parar", "pare", "cala a boca", "silêncio", "silencio", "chega", "cancela", "cancelar"
+        ]
         return stopWords.contains { lower.contains($0) }
     }
 
@@ -680,6 +703,12 @@ final class VoiceCommandService: ObservableObject {
             // Ok Vision variants
             "hey vision",
             "hi vision",
+            "ei vision",
+            "oi vision",
+            "olá vision",
+            "ola vision",
+            "ok visão",
+            "okay visão",
             // Common misrecognitions
             "a vision",
             "heavy vision",
@@ -749,7 +778,7 @@ final class VoiceCommandService: ObservableObject {
         var command = text
         let wakeWordLower = wakeWord.lowercased()
 
-        for prefix in [wakeWordLower, "hey vision", "ok vision", "okay vision"] {
+        for prefix in [wakeWordLower, "hey vision", "ok vision", "okay vision", "ei vision", "oi vision", "olá vision", "ola vision", "ok visão", "okay visão"] {
             if command.lowercased().hasPrefix(prefix) {
                 command = String(command.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
                 break

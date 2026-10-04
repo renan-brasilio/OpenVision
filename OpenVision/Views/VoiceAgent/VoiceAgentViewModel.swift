@@ -30,7 +30,9 @@ final class VoiceAgentViewModel: ObservableObject {
     // MARK: - Published UI state
 
     @Published var isSessionActive = false
-    @Published var agentState: AgentState = .idle
+    @Published var agentState: AgentState = .idle {
+        didSet { updateThinkingSound() }
+    }
     @Published var userTranscript = ""
     @Published var aiTranscript = ""
     @Published var currentToolName: String?
@@ -50,6 +52,11 @@ final class VoiceAgentViewModel: ObservableObject {
     private var lastProcessedCommand = ""
     private var lastProcessedAt = Date.distantPast
     private var hasRequestedSpeechAuth = false
+    private var isViewVisible = false
+    private var sessionTask: Task<Void, Never>?
+    /// Serialize route changes together with the taps/engine starts that depend on them.
+    private var audioSetupTask: Task<Void, Error>?
+    private var audioLifecycleGeneration = 0
 
     /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
     /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
@@ -119,19 +126,24 @@ final class VoiceAgentViewModel: ObservableObject {
     // MARK: - View lifecycle
 
     func onAppear() {
+        isViewVisible = true
         setupVoiceCommandService()
         setupGlassesCallbacks()
         preloadLocalModelIfNeeded()
+        updateThinkingSound()
         // Resume wake-word listening when returning to this screen. onDisappear stops it
         // (e.g. when navigating to Settings), and the one-time .task doesn't re-run on return —
         // so without this, the wake word stayed dead until you tapped the mic button.
         if voiceCommandService.authorizationStatus == .authorized && !voiceCommandService.isListening {
-            startWakeWordListening()
+            Task { await startWakeWordListening() }
         }
     }
 
     func onDisappear() {
-        voiceCommandService.stopListening()
+        isViewVisible = false
+        // Keep recognition alive while another tab is visible. The app scene owns background
+        // suspension; destroying the listener here made every Settings or History visit require
+        // returning to Voice before the wake word worked again.
     }
 
     // MARK: - Observed state changes (forwarded from the view's onChange hooks)
@@ -187,9 +199,10 @@ final class VoiceAgentViewModel: ObservableObject {
         }
     }
 
-    /// Control thinking sound based on agent state.
-    func agentStateChanged(_ newState: AgentState) {
-        if newState == .thinking || newState == .toolRunning {
+    /// Update immediately on state changes, rather than waiting for a SwiftUI render.
+    private func updateThinkingSound() {
+        if isViewVisible, agentState == .thinking || agentState == .toolRunning,
+           !ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking {
             soundService.startThinkingSound()
         } else {
             soundService.stopThinkingSound()
@@ -287,11 +300,9 @@ final class VoiceAgentViewModel: ObservableObject {
             AppleFoundationService.shared.resetContext()
         }
 
-        // Configure audio routing for glasses if registered
-        configureAudioForGlasses()
-
         // Connect to AI backend
-        Task {
+        sessionTask?.cancel()
+        sessionTask = Task {
             do {
                 switch settingsManager.settings.aiBackend {
                 case .openClaw:
@@ -332,21 +343,24 @@ final class VoiceAgentViewModel: ObservableObject {
                     )
                 }
 
+
+                try Task.checkCancellation()
+                guard isSessionActive, isViewVisible else { return }
+
+                // Route configuration must finish before installing recognition taps. Gemini's
+                // camera has already started here, so the preferred route resolves to the phone.
+                if voiceCommandService.authorizationStatus == .authorized {
+                    try await startConfiguredListening(conversation: true)
+                } else {
+                    errorMessage = "Speech recognition not authorized"
+                }
+                try Task.checkCancellation()
                 agentState = .listening
                 userTranscript = ""
                 aiTranscript = ""
 
-                // Start voice command listening for speech capture
-                if voiceCommandService.authorizationStatus == .authorized {
-                    if !voiceCommandService.isListening {
-                        try? voiceCommandService.startListening()
-                    }
-                    // Put in listening mode (not waiting for wake word)
-                    voiceCommandService.enterConversationMode()
-                } else {
-                    errorMessage = "Speech recognition not authorized"
-                }
-
+            } catch is CancellationError {
+                // A stop or disappearance superseded this session's pending audio setup.
             } catch {
                 errorMessage = "Failed to connect: \(error.localizedDescription)"
                 isSessionActive = false
@@ -368,52 +382,94 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Attempting glasses is what makes iOS expose the HFP mic — so we try it directly rather than
     /// pre-checking availability (which can't see HFP until it's allowed). Returns true on glasses.
     @discardableResult
-    private func applyPreferredAudioRoute() -> Bool {
+    private func applyPreferredAudioRoute() async throws -> Bool {
         // Never pick the glasses HFP mic while the camera is streaming: video saturates the
         // Bluetooth link, so the SCO audio channel can't be serviced. configureForGlasses() can
         // still "succeed" in that state, but the mic is deaf — commands are never transcribed
         // (seen when recording starts the stream before a wake-word session). Phone mic instead.
         if settingsManager.settings.preferGlassesMic, glassesManager.isRegistered,
            !glassesManager.isStreaming,
-           (try? AudioSessionManager.shared.configureForGlasses()) == true {
+           (try? await AudioSessionManager.shared.configureForGlasses()) == true,
+           !glassesManager.isStreaming {
             return true
         }
         // Glasses mic off, glasses not connected as audio, or no HFP input available → phone.
         // Loud speaker so spoken replies are audible (not the quiet earpiece).
         print("[VoiceAgent] Using iPhone mic + speaker (glasses mic off or unavailable)")
-        try? AudioSessionManager.shared.configureForPhone()
+        try await AudioSessionManager.shared.configureForPhone()
         return false
     }
 
-    private func configureAudioForGlasses() {
-        // If we're already on the glasses' Bluetooth (HFP) route and still listening, do NOT tear
-        // the audio session down and re-activate it. That re-activation renegotiates the HFP SCO
-        // link, which the glasses render as a "Bluetooth connecting/closing" blip — heard on every
-        // wake after the first (the route stays on HFP between sessions, so the re-config is pure
-        // churn). Skipping it keeps SCO stable, so the wake chime plays cleanly each time.
-        if settingsManager.settings.preferGlassesMic, glassesManager.isRegistered,
-           !glassesManager.isStreaming,   // HFP is deaf while the camera streams — reconfigure to phone
-           AudioSessionManager.shared.isBluetoothHFPActive, voiceCommandService.isListening {
-            return
+    private func cancelPendingAudioSetup() {
+        audioLifecycleGeneration += 1
+        audioSetupTask?.cancel()
+        // Keep the task as the predecessor: canceled hardware work must finish before a new
+        // route is configured, even though its dependent engine start is no longer allowed.
+    }
+
+    private func configureAudio(
+        forcePhone: Bool = false,
+        start: @escaping @MainActor @Sendable () throws -> Void
+    ) async throws {
+        let previous = audioSetupTask
+        let generation = audioLifecycleGeneration
+        let setup = Task { @MainActor in
+            _ = try? await previous?.value
+            try Task.checkCancellation()
+            guard generation == self.audioLifecycleGeneration else { throw CancellationError() }
+
+            // Keep an already-running glasses SCO link stable; reactivation creates audible
+            // Bluetooth reconnect blips. Camera streaming always requires the phone instead.
+            if !forcePhone, self.settingsManager.settings.preferGlassesMic,
+               self.glassesManager.isRegistered, !self.glassesManager.isStreaming,
+               self.voiceCommandService.isListening,
+               await AudioSessionManager.shared.isBluetoothHFPActive {
+                try Task.checkCancellation()
+                guard generation == self.audioLifecycleGeneration else { throw CancellationError() }
+                try start()
+                return
+            }
+
+            self.voiceCommandService.stopListening()
+            self.isVoiceReady = false
+            if forcePhone {
+                try await AudioSessionManager.shared.configureForPhone()
+            } else {
+                try await self.applyPreferredAudioRoute()
+            }
+            try Task.checkCancellation()
+            guard generation == self.audioLifecycleGeneration else { throw CancellationError() }
+            // No suspension between the final lifecycle check and the tap/engine start.
+            try start()
         }
-        let wasListening = voiceCommandService.isListening
-        if wasListening { voiceCommandService.stopListening() }
-        applyPreferredAudioRoute()
-        if wasListening {
-            try? voiceCommandService.startListening()
+        audioSetupTask = setup
+        try await withTaskCancellationHandler {
+            try await setup.value
+        } onCancel: {
+            setup.cancel()
+        }
+    }
+
+    private func startConfiguredListening(
+        conversation: Bool = false,
+        forcePhone: Bool = false
+    ) async throws {
+        try await configureAudio(forcePhone: forcePhone) {
+            try self.voiceCommandService.startListening()
+            self.isVoiceReady = self.voiceCommandService.isListening
+            if conversation { self.voiceCommandService.enterConversationMode() }
         }
     }
 
     func stopSession() {
+        soundService.stopThinkingSound()
         cancelPendingAnswer()
-        // If in live video mode, stop it first
-        if isLiveVideoMode {
-            Task {
+        sessionTask?.cancel()
+        cancelPendingAudioSetup()
+        Task {
+            if isLiveVideoMode {
                 await stopLiveVideoMode()
             }
-        }
-
-        Task {
             switch settingsManager.settings.aiBackend {
             case .openClaw:
                 await OpenClawService.shared.disconnect()
@@ -433,9 +489,14 @@ final class VoiceAgentViewModel: ObservableObject {
             }
 
             // Stop glasses streaming (turns off LED)
-            if glassesManager.isStreaming {
-                print("[VoiceAgent] Stopping glasses stream...")
-                await glassesManager.stopStreaming()
+            await glassesManager.stopStreaming()
+            if isViewVisible, settingsManager.settings.wakeWordEnabled {
+                do {
+                    try await startConfiguredListening()
+                } catch is CancellationError {
+                } catch {
+                    errorMessage = error.localizedDescription
+                }
             }
         }
 
@@ -459,13 +520,13 @@ final class VoiceAgentViewModel: ObservableObject {
         userTranscript = ""
         aiTranscript = ""
         currentToolName = nil
-        isLiveVideoMode = false
     }
 
     /// Full stop for "Ok Vision stop": silence all output, cancel any in-flight generation, and go
     /// quiet back to wake-word listening. The recognizer buffer is already reset by
     /// VoiceCommandService (so the stale transcript can't re-fire); here we just halt + end the turn.
     private func performFullStop() {
+        soundService.stopThinkingSound()
         // "Ok Vision stop" is an interruption too: the user cut the reply off. Close the turn
         // deterministically before stopping the engines — delivered-then-stopped turns finish
         // here (markSpokeDone is gated on firstAudio); a stop mid-thinking leaves the turn open
@@ -534,7 +595,7 @@ final class VoiceAgentViewModel: ObservableObject {
         let authorized = await voiceCommandService.requestAuthorization()
         if authorized {
             print("[VoiceAgent] Speech recognition authorized")
-            startWakeWordListening()
+            await startWakeWordListening()
         } else {
             print("[VoiceAgent] Speech recognition not authorized")
             errorMessage = "Speech recognition not authorized. Please enable in Settings."
@@ -763,6 +824,7 @@ final class VoiceAgentViewModel: ObservableObject {
                     self.ttsStreaming = false
                     self.ttsStreamSpokenChars = 0
                 } else {
+                    self.soundService.stopThinkingSound()
                     // Generation ended (always fires via defer, even when interrupted/superseded).
                     // If a streamed utterance is still open, onAgentMessage never fired to close it —
                     // close it here so streamingActive/isSpeaking don't stick true and freeze the
@@ -781,7 +843,7 @@ final class VoiceAgentViewModel: ObservableObject {
                         // Turn produced no speech (error/interrupt) — release the narration hold.
                         self.commandTurnActive = false
                     }
-                    if self.agentState == .thinking
+                    if (self.agentState == .thinking || self.agentState == .toolRunning)
                         && !self.ttsService.isSpeaking && !NeuralSpeech.isAnySpeaking {
                         // Return to the live video indicator, not plain listening, while in live mode.
                         self.agentState = self.isLiveVideoMode ? .liveVideo
@@ -857,18 +919,15 @@ final class VoiceAgentViewModel: ObservableObject {
         }
     }
 
-    /// Start listening for wake word
-    private func startWakeWordListening() {
-        guard settingsManager.settings.wakeWordEnabled else { return }
+    func startWakeWordListening() async {
+        guard !isLiveVideoMode, settingsManager.settings.wakeWordEnabled else { return }
         guard voiceCommandService.authorizationStatus == .authorized else { return }
 
-        // Configure audio for glasses before starting to listen
-        configureAudioForGlasses()
-
         do {
-            try voiceCommandService.startListening()
-            isVoiceReady = true
+            try await startConfiguredListening()
             print("[VoiceAgent] Started wake word listening - READY")
+        } catch is CancellationError {
+            // Lifecycle cancellation intentionally leaves recognition stopped.
         } catch {
             print("[VoiceAgent] Failed to start listening: \(error)")
             errorMessage = error.localizedDescription
@@ -885,11 +944,18 @@ final class VoiceAgentViewModel: ObservableObject {
         // Matched on WORDS, not substrings: `.contains("stop")` treated "what's on the desktop"
         // as a stop command and killed the session mid-question.
         let commandWords = Set(lowerCommand.split(whereSeparator: { !$0.isLetter }).map(String.init))
-        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough"]
-        let stopPhrases = ["be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it"]
+        let stopSingleWords: Set<String> = [
+            "stop", "quiet", "silence", "enough",
+            "para", "parar", "pare", "silêncio", "silencio", "chega", "cancela", "cancelar"
+        ]
+        let stopPhrases = [
+            "be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it",
+            "cala a boca", "fica quieto", "para de falar", "para aí", "chega de falar"
+        ]
         let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                              || stopPhrases.contains { lowerCommand.contains($0) })
                              && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
+                             && !lowerCommand.contains("vídeo")
 
         if isStopCommand {
             // In live video mode, "stop" means SHUT UP, not "tear down my camera session" —
@@ -912,16 +978,25 @@ final class VoiceAgentViewModel: ObservableObject {
         }
 
         // Check for live video mode commands
-        let startLiveKeywords = ["start video stream", "start live video", "start video", "start streaming",
-                                 "enable video", "live mode", "go live", "video mode"]
+        let startLiveKeywords = [
+            "start video stream", "start live video", "start video", "start streaming",
+            "enable video", "live mode", "go live", "video mode",
+            "iniciar vídeo", "iniciar video", "começar vídeo", "começar video",
+            "iniciar transmissão", "iniciar transmissao", "transmitir vídeo", "transmitir video",
+            "modo ao vivo", "ativar vídeo", "ativar video", "abrir vídeo", "abrir video"
+        ]
 
         let isStartLiveCommand = startLiveKeywords.contains { lowerCommand.contains($0) }
         // Fuzzy stop match: any "video"/"stream" phrase with a stop-like word. Tolerates Apple STT
         // dropping the leading 's' ("stop video" → "top video"), which previously sailed past the
         // exact-keyword list and got sent to the model as a question instead of ending the mode.
-        let mentionsVideo = lowerCommand.contains("video") || lowerCommand.contains("stream")
-        let stopWords = ["stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off"]
+        let mentionsVideo = lowerCommand.contains("video") || lowerCommand.contains("stream") || lowerCommand.contains("vídeo") || lowerCommand.contains("transmiss")
+        let stopWords = [
+            "stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off",
+            "para", "parar", "pare", "encerrar", "fechar", "sair", "desativar", "desligar"
+        ]
         let isStopLiveCommand = mentionsVideo && stopWords.contains { lowerCommand.contains($0) }
+
 
         // Handle live video mode commands
         if isStartLiveCommand {
@@ -998,11 +1073,20 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Check if this is a vision-related command
         // Keywords for "take a photo" - capture and send to OpenClaw
-        let photoKeywords = ["take a photo", "take a picture", "take photo", "take picture",
-                            "capture a photo", "capture photo", "snap a photo", "snap a picture",
-                            "what do you see", "what are you looking at", "look at this",
-                            "what's in front of me", "describe what you see", "what is this",
-                            "what am i looking at", "can you see"]
+        let photoKeywords = [
+            "take a photo", "take a picture", "take photo", "take picture",
+            "capture a photo", "capture photo", "snap a photo", "snap a picture",
+            "what do you see", "what are you looking at", "look at this",
+            "what's in front of me", "describe what you see", "what is this",
+            "what am i looking at", "can you see",
+            // Portuguese:
+            "tira uma foto", "tire uma foto", "tirar foto", "tira foto", "tire foto",
+            "bater foto", "bata uma foto", "bate uma foto", "capturar foto", "captura uma foto",
+            "o que você está vendo", "o que voce esta vendo", "o que você vê", "o que voce ve",
+            "o que estou olhando", "olha isso", "olhe isso", "o que é isso", "o que e isso",
+            "descreva o que você vê", "descreva o que voce ve", "o que tem na minha frente",
+            "o que está na minha frente", "consegue ver", "você consegue ver"
+        ]
 
         let isPhotoCommand = photoKeywords.contains { lowerCommand.contains($0) }
 
@@ -1065,8 +1149,11 @@ final class VoiceAgentViewModel: ObservableObject {
 
         print("[VoiceAgent] Starting live video mode via \(label)...")
 
+        cancelPendingAudioSetup()
+        let generation = audioLifecycleGeneration
         // Stop VoiceCommandService - the live backend will handle audio directly
         voiceCommandService.stopListening()
+        isVoiceReady = false
 
         // Stop TTS if speaking
         ttsService.stop()
@@ -1082,48 +1169,42 @@ final class VoiceAgentViewModel: ObservableObject {
             await glassesManager.startStreaming()
         }
 
-        // Connect to the live backend
         do {
+            guard generation == audioLifecycleGeneration else { throw CancellationError() }
             try await service.connect()
-        } catch {
-            errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
-            activeLiveService = nil
-            // Cleanup: stop streaming and restart voice commands
-            if glassesManager.isStreaming {
-                await glassesManager.stopStreaming()
+            guard generation == audioLifecycleGeneration else { throw CancellationError() }
+
+            setupLiveVideoCallbacks(service)
+            audioCapture.onAudioCaptured = { [weak service] data in
+                service?.sendAudio(data: data)
             }
-            do {
-                try voiceCommandService.startListening()
-                voiceCommandService.enterConversationMode()
-            } catch {
-                print("[VoiceAgent] Failed to restart voice commands: \(error)")
+
+            // The camera occupies the glasses' Bluetooth link. Finish phone hardware routing
+            // before either engine reads its native format, installs taps, or starts capture.
+            try await configureAudio(forcePhone: true) {
+                try self.audioPlayback.setup()
+                try self.audioCapture.startCapture()
             }
-            return
-        }
-
-        // Setup live backend callbacks
-        setupLiveVideoCallbacks(service)
-
-        // Setup audio capture → live backend
-        audioCapture.onAudioCaptured = { [weak service] data in
-            service?.sendAudio(data: data)
-        }
-
-        // Setup audio playback
-        do {
-            try audioPlayback.setup()
+            guard generation == audioLifecycleGeneration else { throw CancellationError() }
         } catch {
-            print("[VoiceAgent] Failed to setup audio playback: \(error)")
-        }
-
-        // Start audio capture
-        do {
-            try audioCapture.startCapture()
-        } catch {
-            errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
+            if !(error is CancellationError) {
+                errorMessage = "Failed to start \(label): \(error.localizedDescription)"
+            }
+            audioCapture.stopCapture()
+            audioCapture.onAudioCaptured = nil
+            audioPlayback.teardown()
             await service.disconnect()
             activeLiveService = nil
-            voiceCommandService.enterConversationMode()
+            await glassesManager.stopStreaming()
+            if generation == audioLifecycleGeneration, isViewVisible,
+               isSessionActive || settingsManager.settings.wakeWordEnabled {
+                do {
+                    try await startConfiguredListening(conversation: isSessionActive)
+                } catch is CancellationError {
+                } catch {
+                    print("[VoiceAgent] Failed to restart voice commands: \(error)")
+                }
+            }
             return
         }
 
@@ -1167,6 +1248,8 @@ final class VoiceAgentViewModel: ObservableObject {
     /// speak through the selected TTS engine as usual.
     private func startLocalLiveVideoMode() async {
         print("[VoiceAgent] Starting local live video mode (SmolVLM2)...")
+        cancelPendingAudioSetup()
+        let generation = audioLifecycleGeneration
 
         if !glassesManager.isStreaming {
             await glassesManager.startStreaming()
@@ -1175,21 +1258,26 @@ final class VoiceAgentViewModel: ObservableObject {
             ttsService.speak("I couldn't start the glasses camera")
             return
         }
+        guard generation == audioLifecycleGeneration else {
+            await glassesManager.stopStreaming()
+            return
+        }
 
         // The glasses' Bluetooth HFP mic can't run while their camera streams (it goes deaf —
         // the PR #15 lesson; photo mode survives because its stream is momentary). Live mode
         // streams continuously, so force the phone mic + speaker for the whole session and
         // rebuild recognition on that route. The preferred route is restored on stop.
-        voiceCommandService.stopListening()
-        try? AudioSessionManager.shared.configureForPhone()
         do {
-            try voiceCommandService.startListening()
+            try await startConfiguredListening(conversation: true, forcePhone: true)
+            guard generation == audioLifecycleGeneration else { throw CancellationError() }
         } catch {
-            print("[VoiceAgent] Failed to restart STT on phone mic: \(error)")
+            if !(error is CancellationError) {
+                print("[VoiceAgent] Failed to restart STT on phone mic: \(error)")
+                errorMessage = error.localizedDescription
+            }
+            await glassesManager.stopStreaming()
+            return
         }
-
-        // Stay in conversation mode so follow-ups don't need the wake word.
-        voiceCommandService.enterConversationMode()
 
         isLiveVideoMode = true
         agentState = .liveVideo
@@ -1216,8 +1304,12 @@ final class VoiceAgentViewModel: ObservableObject {
         // producing another description. Every stop attempt triggered more speech: "it keeps on
         // describing, it doesn't simply stop". Silence everything, stay in live mode ("stop
         // video" remains the phrase that exits).
-        let stopWords: Set<String> = ["stop", "stop it", "stop talking", "be quiet", "quiet",
-                                      "shut up", "enough", "cancel", "silence"]
+        let stopWords: Set<String> = [
+            "stop", "stop it", "stop talking", "be quiet", "quiet",
+            "shut up", "enough", "cancel", "silence",
+            "para", "parar", "pare", "para de falar", "silêncio", "silencio",
+            "cala a boca", "chega", "cancela", "cancelar"
+        ]
         if stopWords.contains(lower.trimmingCharacters(in: .whitespacesAndNewlines)) {
             NSLog("[OV] live: bare stop — silencing, staying in live mode")
             MetricsCollector.shared.markInterrupted()
@@ -1509,6 +1601,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// (speak/beginStreaming) restart the player; a watch line using them cut user replies off
     /// mid-sentence whenever one landed during the line's synthesis window.
     private func speakWatchLine(_ text: String) {
+        soundService.stopThinkingSound()
         if let neuralTTS {
             Task { await neuralTTS.speakAmbient(text) }
         } else {
@@ -1558,6 +1651,12 @@ final class VoiceAgentViewModel: ObservableObject {
             print("[VoiceAgent] Not in live video mode")
             return
         }
+        // Mark stopped before disconnecting: the backend's disconnect callback must not
+        // enqueue a second teardown/restoration while this one is suspended.
+        isLiveVideoMode = false
+        cancelPendingAudioSetup()
+        voiceCommandService.stopListening()
+        isVoiceReady = false
         stopWatchLoop()
 
         print("[VoiceAgent] Stopping live video mode...")
@@ -1574,36 +1673,25 @@ final class VoiceAgentViewModel: ObservableObject {
         activeLiveService = nil
 
         // Stop glasses streaming
-        if glassesManager.isStreaming {
-            await glassesManager.stopStreaming()
-        }
+        await glassesManager.stopStreaming()
 
         // Restore video frame callback to Gemini Vision
         glassesManager.onVideoFrame = { [weak self] image in
             self?.geminiVision.sendVideoFrame(image)
         }
 
-        isLiveVideoMode = false
         agentState = isSessionActive ? .listening : .idle
 
-        // Local live mode forced the phone mic (HFP dies during camera streaming) and its STT
-        // may still be running — stop it so the restart below picks up the preferred route.
-        if voiceCommandService.isListening { voiceCommandService.stopListening() }
-        applyPreferredAudioRoute()
-
-        // Always restart VoiceCommandService for wake word detection
-        do {
-            try voiceCommandService.startListening()
-            if isSessionActive {
-                // Continue conversation mode if session was active
-                voiceCommandService.enterConversationMode()
-                print("[VoiceAgent] Restarted voice commands in conversation mode")
-            } else {
-                // Just listen for wake word
-                print("[VoiceAgent] Restarted voice commands for wake word detection")
+        // Restore the user's preferred route only after the camera is off, then rebuild
+        // recognition. Disappearing or disabling wake words must not revive a stopped listener.
+        if isViewVisible, isSessionActive || settingsManager.settings.wakeWordEnabled {
+            do {
+                try await startConfiguredListening(conversation: isSessionActive)
+                print("[VoiceAgent] Restarted voice commands after live video")
+            } catch is CancellationError {
+            } catch {
+                print("[VoiceAgent] Failed to restart voice commands: \(error)")
             }
-        } catch {
-            print("[VoiceAgent] Failed to restart voice commands: \(error)")
         }
 
         print("[VoiceAgent] Live video mode stopped")
@@ -1614,6 +1702,7 @@ final class VoiceAgentViewModel: ObservableObject {
     private func setupLiveVideoCallbacks(_ service: any LiveVideoService) {
         // Audio from the model → playback
         service.onAudioReceived = { [weak self] data in
+            self?.soundService.stopThinkingSound()
             self?.audioPlayback.playAudio(data: data)
         }
 
@@ -1625,11 +1714,14 @@ final class VoiceAgentViewModel: ObservableObject {
 
                 // Check for stop video commands in what the user said
                 let lowerText = text.lowercased()
-                let stopKeywords = ["stop video", "stop streaming", "stop live", "end video",
-                                   "exit video", "disable video", "stop the video", "end live",
-                                   // Hindi fallbacks (models sometimes transcribe English as Hindi)
-                                   "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
-
+                let stopKeywords = [
+                    "stop video", "stop streaming", "stop live", "end video",
+                    "exit video", "disable video", "stop the video", "end live",
+                    "parar vídeo", "parar video", "parar transmissão", "parar transmissao",
+                    "encerrar vídeo", "encerrar video", "fechar vídeo", "fechar video",
+                    // Hindi fallbacks (models sometimes transcribe English as Hindi)
+                    "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"
+                ]
                 let isStopCommand = stopKeywords.contains { lowerText.contains($0) }
 
                 if isStopCommand && self.isLiveVideoMode {
@@ -1682,12 +1774,15 @@ final class VoiceAgentViewModel: ObservableObject {
         let triggers = [
             "take a picture of this", "take a photo of this", "take a picture", "take a photo",
             "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
-            "snap a picture", "go ahead and take"
+            "snap a picture", "go ahead and take",
+            "tira uma foto disso", "tire uma foto disso", "tira uma foto de", "tire uma foto de",
+            "tira uma foto", "tire uma foto", "tirar foto", "tira foto", "tire foto",
+            "bata uma foto", "bate uma foto", "bater foto", "captura uma foto", "capturar foto"
         ]
         for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
         s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         // Trim leftover connective prefixes left after removing the trigger ("...and tell me…").
-        for prefix in ["and ", "of this ", "of ", "please "] {
+        for prefix in ["and ", "of this ", "of ", "please ", "e me diga ", "e me fala ", "por favor "] {
             while s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)) }
         }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
@@ -1886,24 +1981,9 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Get a fresh UIImage frame from the glasses camera, then turn the camera off
     /// ("click and go") — unless we're in live video mode.
     private func currentGlassesImage() async -> UIImage? {
-        guard glassesManager.isRegistered else { return nil }
-        if !glassesManager.isStreaming { await glassesManager.startStreaming() }
-        var frame: UIImage?
-        for _ in 0..<40 {   // up to ~4s for a fresh frame
-            if let f = glassesManager.lastFrame { frame = f; break }
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-        if frame == nil { frame = glassesManager.lastFrame }
-        if glassesManager.isStreaming && !isLiveVideoMode {
-            await glassesManager.stopStreaming()
-        }
-        // Do NOT touch the audio stack here. Tearing down / rebuilding the recognizer around the
-        // camera is what broke the HFP mic: every rebuild forces a fresh Bluetooth SCO negotiation,
-        // which the glasses can't service right after streaming (mic stays deaf for tens of seconds,
-        // with an audible reconnect chirp per attempt). OpenGlasses keeps its wake-word engine + mic
-        // tap alive straight through photo capture — audio just gaps during the stream and resumes
-        // into the same running engine. We now do the same; see restartRecognition()'s engine check.
-        return frame
+        guard let data = await freshLiveFrame(), let image = UIImage(data: data) else { return nil }
+        if !isLiveVideoMode { await glassesManager.stopStreaming() }
+        return image
     }
 
     /// Send a prompt (optionally with a photo) to whichever backend is currently selected.
@@ -1944,7 +2024,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // "Click and go": now that we have the photo, turn the glasses camera off immediately —
         // before the (multi-second) model inference — so the LED doesn't stay on. Repeat photo
         // commands restart the camera reliably via freshLiveFrame(). Skip in live video mode.
-        if imageData != nil && glassesManager.isStreaming && !isLiveVideoMode {
+        if imageData != nil && !isLiveVideoMode {
             NSLog("[OV] photo captured — stopping camera (click and go)")
             await glassesManager.stopStreaming()
         }
@@ -1970,7 +2050,7 @@ final class VoiceAgentViewModel: ObservableObject {
             agentState = isSessionActive ? .listening : .idle
 
             // Stop streaming on error if we started it for this photo
-            if startedStreamingForPhoto && glassesManager.isStreaming {
+            if startedStreamingForPhoto {
                 await glassesManager.stopStreaming()
             }
         }
@@ -1997,36 +2077,38 @@ final class VoiceAgentViewModel: ObservableObject {
         return nil
     }
 
+
     /// Force a fresh live video frame, restarting the stream if it has stalled.
     /// More reliable than the one-shot photo capture for repeated requests in a session.
     private func freshLiveFrame() async -> Data? {
         guard glassesManager.isRegistered else { return nil }
-        if !glassesManager.isStreaming {
-            await glassesManager.startStreaming()
-        }
-        // Wait for a NEW frame (clear first so we don't reuse a stale one).
-        glassesManager.lastFrame = nil
-        for _ in 0..<25 { // up to ~2.5s
-            if let f = glassesManager.lastFrame {
-                NSLog("[OV] fresh live frame acquired")
-                return f.jpegData(compressionQuality: 0.8)
+        let requestedAt = Date()
+        if !glassesManager.isStreaming { await glassesManager.startStreaming() }
+        guard glassesManager.isStreaming else { return nil }
+
+        for _ in 0..<60 { // Hardware startup can take longer than the first frame interval.
+            if glassesManager.lastFrameTime >= requestedAt,
+               let frame = glassesManager.lastFrame,
+               let data = frame.jpegData(compressionQuality: 0.8) {
+                return data
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        // Stream appears stalled — restart it once and retry.
+
         NSLog("[OV] live frame stalled — restarting stream")
         await glassesManager.stopStreaming()
-        try? await Task.sleep(nanoseconds: 400_000_000)
+        let restartedAt = Date()
         await glassesManager.startStreaming()
-        glassesManager.lastFrame = nil
-        for _ in 0..<30 { // up to ~3s
-            if let f = glassesManager.lastFrame {
-                NSLog("[OV] fresh live frame acquired after restart")
-                return f.jpegData(compressionQuality: 0.8)
+        guard glassesManager.isStreaming else { return nil }
+        for _ in 0..<60 {
+            if glassesManager.lastFrameTime >= restartedAt,
+               let frame = glassesManager.lastFrame,
+               let data = frame.jpegData(compressionQuality: 0.8) {
+                return data
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
-        NSLog("[OV] freshLiveFrame: STILL no frame after restart")
+        await glassesManager.stopStreaming()
         return nil
     }
 
@@ -2142,6 +2224,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// play before sentence 1 (the comment claiming order was preserved was wrong). Kokoro now
     /// owns a FIFO drained by a single task, making ordering structural.
     private func speakStreamedChunk(_ sentence: String) {
+        soundService.stopThinkingSound()
         // First-wins: the first sentence handed over starts the TTS TTFB clock.
         MetricsCollector.shared.markTTSRequested()
         if let neuralTTS = streamingNeuralTTS {
@@ -2154,6 +2237,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Speak AI response via TTS
     private func speakResponse(_ text: String) {
         guard !text.isEmpty else { return }
+        soundService.stopThinkingSound()
         recordAssistantReply(text)
         // Perceived latency ends here: the gap between this and speechEnd is the wearer's wait.
         // (An approximation — synthesis still has to start — but it is the moment we hand off,
@@ -2177,6 +2261,7 @@ final class VoiceAgentViewModel: ObservableObject {
     /// directly rather than through speakResponse, so it isn't recorded as the turn's answer.
     func askUser(_ prompt: String) async -> String? {
         cancelPendingAnswer()
+        soundService.stopThinkingSound()
         if let neuralTTS {
             questionPrompt = Task {
                 guard !Task.isCancelled else { return }

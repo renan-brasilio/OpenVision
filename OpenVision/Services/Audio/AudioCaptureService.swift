@@ -68,7 +68,14 @@ final class AudioCaptureService: ObservableObject {
             self?.processAudioBuffer(buffer, nativeFormat: nativeFormat)
         }
 
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            audioEngine = nil
+            self.inputNode = nil
+            throw error
+        }
         isCapturing = true
         print("[AudioCapture] Started capturing")
     }

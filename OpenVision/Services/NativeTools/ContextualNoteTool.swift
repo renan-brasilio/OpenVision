@@ -5,6 +5,7 @@
 
 import Foundation
 import CoreLocation
+import MapKit
 
 struct ContextualNoteTool: NativeTool {
     let name = "note"
@@ -31,7 +32,7 @@ struct ContextualNoteTool: NativeTool {
             let (loc, place) = await LocationHelper.shared.currentPlace()
             let note = ContextualNote(
                 id: UUID().uuidString, content: content, tags: tags,
-                latitude: loc?.coordinate.latitude, longitude: loc?.coordinate.longitude,
+                latitude: loc?.latitude, longitude: loc?.longitude,
                 locationName: place, createdAt: Date())
             ContextualNoteStore.shared.save(note)
             var response = "Noted"
@@ -131,10 +132,17 @@ final class ContextualNoteStore {
 /// Uses the *cached* location rather than blocking on a fresh GPS fix — a note must save instantly.
 /// The delegate keeps the last fix warm; the reverse-geocode is hard-bounded to ~3s. If no recent
 /// location is available yet, the note simply saves without a place (and warms up for next time).
+@MainActor
 final class LocationHelper: NSObject, CLLocationManagerDelegate {
     static let shared = LocationHelper()
     private let manager = CLLocationManager()
     private var lastFix: CLLocation?
+
+    /// Only coordinate values leave the main actor; CLLocationManager and its cached fix do not.
+    struct Fix: Sendable {
+        let latitude: Double
+        let longitude: Double
+    }
 
     override init() {
         super.init()
@@ -144,11 +152,11 @@ final class LocationHelper: NSObject, CLLocationManagerDelegate {
         if s == .authorizedWhenInUse || s == .authorizedAlways { manager.requestLocation() }
     }
 
-    /// Touch the singleton at launch (from the main thread) so CLLocationManager lives on a thread
-    /// with a run loop and its delegate callbacks fire.
+    /// Touch the singleton at launch to warm the cache. Main-actor initialization keeps the
+    /// manager and its delegate callbacks on the main run loop.
     func prewarm() {}
 
-    func currentPlace() async -> (CLLocation?, String?) {
+    func currentPlace() async -> (Fix?, String?) {
         let status = manager.authorizationStatus
         if status == .notDetermined {
             manager.requestWhenInUseAuthorization()   // dialog now; this note saves without a place
@@ -159,34 +167,77 @@ final class LocationHelper: NSObject, CLLocationManagerDelegate {
         manager.requestLocation()   // refresh for next time (non-blocking)
         guard let loc, Date().timeIntervalSince(loc.timestamp) < 600 else { return (nil, nil) }
         let name = await Self.reverseGeocode(loc)
-        return (loc, name)
+        return (Fix(latitude: loc.coordinate.latitude, longitude: loc.coordinate.longitude), name)
     }
 
-    func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) { lastFix = locs.last }
-    func locationManager(_ m: CLLocationManager, didFailWithError error: Error) {}
+    nonisolated func locationManager(_ m: CLLocationManager, didUpdateLocations locs: [CLLocation]) {
+        // CLLocationManager.h specifies delegate delivery on its initialization run loop.
+        // This manager is initialized on MainActor, so no location object crosses actors.
+        MainActor.assumeIsolated { lastFix = locs.last }
+    }
+    nonisolated func locationManager(_ m: CLLocationManager, didFailWithError error: Error) {}
 
-    /// Completion-handler geocode with a hard 3s timeout (cancels the geocode) so it can never hang.
+    /// Both SDK paths use the same main-actor one-shot timeout, including late completion.
     private static func reverseGeocode(_ loc: CLLocation) async -> String? {
+        if #available(iOS 26.0, *) {
+            return await reverseGeocodeWithMapKit(loc)
+        } else {
+            return await reverseGeocodeWithCoreLocation(loc)
+        }
+    }
+
+    @available(iOS 26.0, *)
+    private static func reverseGeocodeWithMapKit(_ loc: CLLocation) async -> String? {
+        guard let request = MKReverseGeocodingRequest(location: loc) else { return nil }
+        return await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
+            let once = GeocodeResume(c, cancel: { request.cancel() })
+            // MKReverseGeocodingRequest.h annotates this completion NS_SWIFT_UI_ACTOR.
+            request.getMapItems { items, _ in
+                let item = items?.first
+                once.resume(item?.name ?? item?.address?.shortAddress ?? item?.addressRepresentations?.cityName)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { once.timeOut() }
+        }
+    }
+
+    // CoreLocation's geocoder is used only on OS versions before its iOS 26 replacement.
+    @available(iOS, introduced: 5.0, obsoleted: 26.0)
+    private static func reverseGeocodeWithCoreLocation(_ loc: CLLocation) async -> String? {
         await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
             let geocoder = CLGeocoder()
-            let once = GeocodeResume(c)
+            let once = GeocodeResume(c, cancel: { geocoder.cancelGeocode() })
             geocoder.reverseGeocodeLocation(loc) { placemarks, _ in
-                once.resume(placemarks?.first?.name ?? placemarks?.first?.subLocality ?? placemarks?.first?.locality)
+                // The legacy SDK callback has no actor annotation. Extract a Sendable string
+                // here and explicitly hop before touching the one-shot continuation.
+                let name = placemarks?.first?.name ?? placemarks?.first?.subLocality ?? placemarks?.first?.locality
+                Task { @MainActor in once.resume(name) }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                geocoder.cancelGeocode(); once.resume(nil)
-            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { once.timeOut() }
         }
     }
 }
 
-/// Resumes a continuation exactly once (the geocode completion and the timeout race on the main queue).
+/// Completion and timeout may arrive in either order; all state is confined to MainActor.
+@MainActor
 private final class GeocodeResume {
     private var cont: CheckedContinuation<String?, Never>?
-    init(_ c: CheckedContinuation<String?, Never>) { cont = c }
-    func resume(_ s: String?) {
+    private let cancel: @MainActor () -> Void
+
+    init(_ c: CheckedContinuation<String?, Never>, cancel: @escaping @MainActor () -> Void) {
+        cont = c
+        self.cancel = cancel
+    }
+
+    func resume(_ name: String?) {
         guard let c = cont else { return }
         cont = nil
-        c.resume(returning: s)
+        c.resume(returning: name)
+    }
+
+    func timeOut() {
+        guard cont != nil else { return }
+        // Consume the continuation before cancellation, which may itself trigger completion.
+        resume(nil)
+        cancel()
     }
 }

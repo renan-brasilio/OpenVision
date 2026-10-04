@@ -373,7 +373,7 @@ final class KokoroTTSService: ObservableObject {
     func deleteModel() {
         engine = nil
         voiceCache.removeAll()
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         try? FileManager.default.removeItem(at: storageDir)
         try? FileManager.default.createDirectory(at: storageDir, withIntermediateDirectories: true)
         downloadProgress = 0

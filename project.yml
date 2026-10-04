@@ -165,8 +165,13 @@ schemes:
         OpenVision: all
     run:
       config: Debug
+      enableGPUValidationMode: false
+      enableGPUFrameCaptureMode: disabled
       commandLineArguments:
         "-FIRDebugEnabled": false
+      environmentVariables:
+        MTL_DEBUG_LAYER: "0"
+        METAL_DEBUG_ERROR_MODE: "0"
     test:
       config: Debug
       gatherCoverageData: true

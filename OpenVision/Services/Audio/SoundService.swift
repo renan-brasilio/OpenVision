@@ -1,12 +1,10 @@
 // OpenVision - SoundService.swift
 // Service for playing UI sound effects.
 //
-// The wake-word "I'm listening" chime plays via AVAudioPlayer on the app's active audio session,
-// so it follows the current route — crucially the glasses' Bluetooth (HFP) speaker when they're
-// connected. System sounds (AudioServicesPlaySystemSound) always go to the phone speaker, so with
-// the phone in a pocket you'd hear nothing on the glasses — which is why the chime was silent.
+// Chimes and the thinking loop use the active audio session, so they follow its output route
+// (including the glasses' Bluetooth speaker) without reconfiguring audio hardware.
 
-import AudioToolbox
+import Combine
 import AVFoundation
 import Foundation
 
@@ -21,17 +19,18 @@ final class SoundService: ObservableObject {
 
     /// AVAudioPlayer so the wake-word chime routes to the active output (the glasses when connected).
     private var wakeWordPlayer: AVAudioPlayer?
-
-    // MARK: - System Sound IDs
-
-    private var wakeWordSoundID: SystemSoundID = 0
-    private var thinkingSoundID: SystemSoundID = 0
-
-    // MARK: - State
-
-    @Published var isPlayingThinkingSound: Bool = false
-    private var thinkingTimer: Timer?
     private var hasSetupSounds = false
+    private var settingsSubscription: AnyCancellable?
+    private var thinkingTask: Task<Void, Never>?
+    private var thinkingRequested = false
+    private var cameraAccessInProgress = false
+
+    var isPlayingThinkingSound: Bool {
+        get async {
+            await thinkingTask?.value
+            return await AudioSessionManager.shared.isPlayingThinkingSound
+        }
+    }
 
     // MARK: - Settings
 
@@ -42,16 +41,14 @@ final class SoundService: ObservableObject {
     // MARK: - Initialization
 
     private init() {
-        // Don't setup sounds here - do it lazily
-    }
-
-    deinit {
-        if wakeWordSoundID != 0 {
-            AudioServicesDisposeSystemSoundID(wakeWordSoundID)
-        }
-        if thinkingSoundID != 0 {
-            AudioServicesDisposeSystemSoundID(thinkingSoundID)
-        }
+        // SettingsManager publishes synchronously from MainActor; cancel starts when disabled.
+        settingsSubscription = SettingsManager.shared.$settings
+            .map(\.playThinkingSound)
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard !enabled else { return }
+                MainActor.assumeIsolated { self?.stopThinkingSound() }
+            }
     }
 
     // MARK: - Lazy Setup
@@ -68,11 +65,6 @@ final class SoundService: ObservableObject {
             wakeWordPlayer = try? AVAudioPlayer(contentsOf: wakeURL)
             wakeWordPlayer?.prepareToPlay()
         }
-
-        // Thinking loop sound (stays a system sound — ambient, phone-side is fine)
-        if let url = Bundle.main.url(forResource: "thinking_loop", withExtension: "mp3") {
-            AudioServicesCreateSystemSoundID(url as CFURL, &thinkingSoundID)
-        }
     }
 
     // MARK: - Wake Word Sound
@@ -87,8 +79,6 @@ final class SoundService: ObservableObject {
         if let player = wakeWordPlayer {
             player.currentTime = 0
             player.play()
-        } else if wakeWordSoundID != 0 {
-            AudioServicesPlaySystemSound(wakeWordSoundID)   // fallback
         }
     }
 
@@ -100,41 +90,57 @@ final class SoundService: ObservableObject {
         if let player = wakeWordPlayer {
             player.currentTime = 0
             player.play()
-        } else if wakeWordSoundID != 0 {
-            AudioServicesPlaySystemSound(wakeWordSoundID)
         }
     }
 
     // MARK: - Thinking Sound
 
     func startThinkingSound() {
-        guard soundEnabled else { return }
-        guard !isPlayingThinkingSound else { return }
-
-        ensureSoundsReady()
-        isPlayingThinkingSound = true
-
-        // Play immediately
-        playThinkingSoundOnce()
-
-        // Set up timer to repeat every 3 seconds
-        thinkingTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.playThinkingSoundOnce()
-            }
-        }
+        guard SettingsManager.shared.settings.playThinkingSound, !thinkingRequested else { return }
+        thinkingRequested = true
+        startThinkingPlayback()
     }
 
     func stopThinkingSound() {
-        isPlayingThinkingSound = false
-        thinkingTimer?.invalidate()
-        thinkingTimer = nil
+        guard thinkingRequested else { return }
+        thinkingRequested = false
+        stopThinkingPlayback()
     }
 
-    private func playThinkingSoundOnce() {
-        guard isPlayingThinkingSound else { return }
-        if thinkingSoundID != 0 {
-            AudioServicesPlaySystemSound(thinkingSoundID)
+    /// Camera access must wait until pending HFP playback has actually stopped.
+    func beginCameraAccess() async {
+        if !cameraAccessInProgress {
+            cameraAccessInProgress = true
+            if thinkingRequested { stopThinkingPlayback() }
+        }
+        await thinkingTask?.value
+    }
+
+    /// Only the owner of camera teardown releases this gate, after the SDK session has stopped.
+    func endCameraAccess() {
+        guard cameraAccessInProgress else { return }
+        cameraAccessInProgress = false
+        startThinkingPlayback()
+    }
+
+    private func startThinkingPlayback() {
+        guard thinkingRequested, !cameraAccessInProgress,
+              SettingsManager.shared.settings.playThinkingSound else { return }
+        let previous = thinkingTask
+        thinkingTask = Task {
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            await AudioSessionManager.shared.startThinkingSound()
+        }
+    }
+
+    private func stopThinkingPlayback() {
+        guard let previous = thinkingTask else { return }
+        previous.cancel()
+        // Keep ordering even when a canceled start is already waiting on audio hardware.
+        thinkingTask = Task {
+            await previous.value
+            await AudioSessionManager.shared.stopThinkingSound()
         }
     }
 }

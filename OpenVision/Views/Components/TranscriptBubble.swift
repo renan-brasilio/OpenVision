@@ -115,7 +115,7 @@ struct TranscriptView: View {
                     }
                     .frame(maxHeight: 190)
                     .fixedSize(horizontal: false, vertical: aiFitsWithoutScrolling)
-                    .onChange(of: aiText) { _ in
+                    .onChange(of: aiText) {
                         // Follow the newest text as it streams in.
                         withAnimation(.easeOut(duration: 0.15)) {
                             proxy.scrollTo("reply", anchor: .bottom)

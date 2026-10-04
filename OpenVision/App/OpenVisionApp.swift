@@ -2,6 +2,7 @@
 // App entry point with URL scheme handling for Meta AI registration
 
 import SwiftUI
+import AVFoundation
 import MWDATCore
 
 @main
@@ -59,11 +60,17 @@ struct OpenVisionApp: App {
                 // relaunch (or a jetsam kill during a model switch) silently stopped pushing.
                 MetricsCollector.shared.restoreAtLaunch()
             }
+            .onChange(of: scenePhase) { _, phase in
+                handleScenePhase(phase)
+            }
             .onOpenURL { url in
                 handleURL(url)
             }
         }
     }
+
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var voiceAgent = VoiceAgentViewModel()
 
     // MARK: - URL Handling
 
@@ -78,6 +85,20 @@ struct OpenVisionApp: App {
             } catch {
                 print("[OpenVisionApp] Error handling URL: \(error)")
             }
+        }
+    }
+
+    private func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .active, .inactive:
+            Task {
+                try? await AudioSessionManager.shared.maintainBackgroundAudio()
+                await voiceAgent.startWakeWordListening()
+            }
+        case .background:
+            Task { try? await AudioSessionManager.shared.maintainBackgroundAudio() }
+        @unknown default:
+            break
         }
     }
 }

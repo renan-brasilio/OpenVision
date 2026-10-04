@@ -181,6 +181,13 @@ final class GemmaLocalService: ObservableObject {
     private var modelContainer: ModelContainer?
     private var loadedModelId: String?
 
+    /// Text-only snapshots can cross `ModelContainer.perform`'s @Sendable boundary.
+    /// Library chat messages also support non-Sendable media, so construct those inside it.
+    private struct TextMessage: Sendable {
+        let role: Chat.Message.Role
+        let content: String
+    }
+
     /// The model currently loaded in memory, or nil when none is. Distinct from the *selected*
     /// model in settings — telemetry must report what actually served a turn, not what is picked.
     var activeModelId: String? { loadedModelId }
@@ -206,7 +213,7 @@ final class GemmaLocalService: ObservableObject {
     /// (observed: SIGKILL right at "starting generation"). 384 → 1 tile + the global image =
     /// 2 encoder inputs. This is the documented SmolVLM memory knob (lower longest_edge to
     /// trade detail for memory); raise to 768 (5 tiles) if quality needs it and memory allows.
-    private static let smolVLMMaxLongestEdge = 384
+    nonisolated private static let smolVLMMaxLongestEdge = 384
 
     /// Rewrite `preprocessor_config.json` in the downloaded SmolVLM snapshot(s) to cap
     /// `size.longest_edge`. Safe against re-downloads: the HuggingFace cache is existence-checked
@@ -367,11 +374,13 @@ final class GemmaLocalService: ObservableObject {
         let modelId = model.modelId
         let expected = max(model.expectedDownloadBytes, 1)
         let started = Date()
-        let poller = Task.detached { [weak self] in
+        let poller = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                let bytes = Self.inFlightDownloadBytes(for: modelId, since: started)
+                let bytes = await Task.detached {
+                    Self.inFlightDownloadBytes(for: modelId, since: started)
+                }.value
                 let est = min(0.99, Double(bytes) / Double(expected))
-                await MainActor.run { self?.bumpDownloadProgress(est) }
+                self?.bumpDownloadProgress(est)
                 try? await Task.sleep(nanoseconds: 700_000_000)
             }
         }
@@ -399,9 +408,9 @@ final class GemmaLocalService: ObservableObject {
 
     /// Load (downloading if needed) a model container, using the vision or text factory based on
     /// the model type. Both produce an MLXLMCommon `ModelContainer` that generates identically.
-    private func loadModelContainer(modelId: String, progress: @escaping (Double) -> Void) async throws -> ModelContainer {
+    private func loadModelContainer(modelId: String, progress: @Sendable @escaping (Double) -> Void) async throws -> ModelContainer {
         let configuration = ModelConfiguration(id: modelId)
-        let handler: (Progress) -> Void = { p in Task { @MainActor in progress(p.fractionCompleted) } }
+        let handler: @Sendable (Progress) -> Void = { p in Task { @MainActor in progress(p.fractionCompleted) } }
         // Register the shared-KV-aware Gemma 4 text backbone before loading. The multimodal VLM
         // Gemma 4 wrapper builds its text tower from this same type registry, so E2B needs it too.
         await Self.registerGemma4TextType()
@@ -756,76 +765,17 @@ final class GemmaLocalService: ObservableObject {
         // vision (SmolVLM2). Gemma 4 E2B's image encoding pushed memory to the ~6GB jetsam limit
         // and crashed, so for every other model `imageData` is ignored and photo commands route
         // to a cloud backend (VoiceAgentView gates that path on `visionReady`).
-        var visionImage: CIImage?
-        if let imageData, visionReady {
-            visionImage = CIImage(data: imageData)
-            if visionImage == nil {
-                NSLog("[OV] GemmaLocal: image data didn't decode — falling back to text-only")
-            }
-        }
-
-        // Keep replies short — this is spoken aloud on glasses, so long answers get tiresome
-        // (and the TTS cuts off after ~a minute). Aim for a couple of natural sentences.
-        var brevity = "You are a hands-free voice assistant for smart glasses. Reply in 2–4 natural sentences — enough detail to be genuinely useful and give a real sense of things, but brief enough to hear comfortably (around 20–30 seconds). Be specific and concrete, not vague. No lists, no markdown, no preamble; just answer."
-        // Hallucination defense: SmolVLM confidently invents details it can't see (research puts
-        // its "describe a thing that isn't there" rate near 94%, dropping to ~22% with a grounding
-        // prompt). Anchor it to THIS frame and let it admit uncertainty rather than guess — this is
-        // what stops the live feed from narrating stale/blurry glimpses when the head is moving.
-        if visionImage != nil {
-            brevity += " You are looking through the glasses camera right now. Describe ONLY what is clearly and currently visible in this exact image. If it's blurry, dark, partly out of frame, or you're not certain what something is, say so briefly instead of guessing — never mention objects you aren't confident are actually present."
-        }
+        let visionData = visionReady ? imageData : nil
         let userSys = SettingsManager.shared.settings.userPrompt
-        var systemContent = userSys.isEmpty ? brevity : "\(userSys)\n\n\(brevity)"
-
-        // Document-focus mode: while the user works with a document, its excerpts ride along —
-        // including on VISION turns, so "does this match my letter?" can ground against the
-        // document while looking at the frame. (Quality caveat: SmolVLM2 is small; heavy text
-        // context alongside an image is a known strain — kept because the grounded use case
-        // outweighs it, and the excerpts are bounded.)
-        if let docContext = await DocumentFocus.shared.contextForQuery(text) {
-            systemContent += "\n\n" + docContext
-        }
-
-        var chat: [Chat.Message] = []
-        chat.append(.init(role: .system, content: systemContent))
-        // Session context so follow-ups work ("what about the one on the left?") — text turns
-        // only; past frames are never re-sent (each vision turn sees only the current frame).
-        //
-        // Refusal quarantine for VISION turns: if an earlier turn ever produced "please upload an
-        // image" (a vision question that reached the model text-only), a sub-1B model will parrot
-        // that refusal from history on every later turn EVEN WITH an image attached — same
-        // context-over-pixels failure as the grounding bug. Narrow, deterministic markers only.
-        // includeHistory=false is the caller saying "the scene has CHANGED since the last
-        // exchange — answer with fresh eyes". History full of 'what do you see -> a desk with
-        // two monitors' made the model copy the old answer to the identical question while
-        // looking at a WALL (the attached image was verified correct in the console; the words
-        // came from history). Fourth incarnation of the same law: a sub-1B model believes its
-        // context over its eyes, so context must be provably consistent with the pixels.
-        let historyTurns = includeHistory ? ConversationContext.shared.turns : []
-        let refusalMarkers = ["upload an image", "provide an image", "can't see the image",
-                              "cannot see the image", "unable to see", "no image"]
-        for turn in historyTurns {
-            if visionImage != nil, turn.role == "assistant",
-               refusalMarkers.contains(where: { turn.content.lowercased().contains($0) }) {
-                NSLog("[OV] GemmaLocal: dropping refusal turn from vision history")
-                continue
+        let docContext = DocumentFocus.shared.contextForQuery(text)
+        // Snapshot only text; past frames are never sent again. The image-dependent grounding
+        // prompt and refusal quarantine are applied after decoding inside the model container.
+        let history: [TextMessage] = includeHistory
+            ? ConversationContext.shared.turns.map {
+                .init(role: $0.role == "assistant" ? .assistant : .user, content: $0.content)
             }
-            chat.append(.init(role: turn.role == "assistant" ? .assistant : .user, content: turn.content))
-        }
-        if let visionImage {
-            chat.append(.init(role: .user, content: text, images: [.ciImage(visionImage)]))
-        } else {
-            chat.append(.init(role: .user, content: text))
-        }
-        // Resize policy is model-specific:
-        //  • SmolVLM: pre-shrink to 512 so its (patched) tiler stays cheap — the jetsam killer was
-        //    full-resolution encoding.
-        //  • FastVLM: DON'T pre-shrink. Its FastViTHD encoder is built to ingest high-res frames
-        //    cheaply (few visual tokens), so downscaling would throw away its main advantage; let
-        //    its own processor handle sizing.
+            : []
         let loadedIsFastVLM = loadedModelId.map { GemmaLocalModel.from(modelId: $0).isFastVLM } ?? false
-        let resize: CGSize? = (visionImage != nil && !loadedIsFastVLM) ? CGSize(width: 512, height: 512) : nil
-        let userInput = UserInput(chat: chat, processing: .init(resize: resize))
 
         // Tag this generation. If a newer request starts, older ones stop and stay silent —
         // prevents a stale reply (e.g. a previous photo's description) bleeding into a new answer.
@@ -844,6 +794,37 @@ final class GemmaLocalService: ObservableObject {
 
         NSLog("[OV] GemmaLocal: starting generation…")
         let stream = try await container.perform { (context: ModelContext) in
+            // Only Data, strings, and checked-Sendable text snapshots cross into this closure.
+            // UserInput can contain MLXArray/media, and must not be promised globally Sendable.
+            let visionImage = visionData.flatMap { CIImage(data: $0) }
+            if visionData != nil, visionImage == nil {
+                NSLog("[OV] GemmaLocal: image data didn't decode — falling back to text-only")
+            }
+            var brevity = "You are a hands-free voice assistant for smart glasses. Reply in 2–4 natural sentences — enough detail to be genuinely useful and give a real sense of things, but brief enough to hear comfortably (around 20–30 seconds). Be specific and concrete, not vague. No lists, no markdown, no preamble; just answer."
+            if visionImage != nil {
+                brevity += " You are looking through the glasses camera right now. Describe ONLY what is clearly and currently visible in this exact image. If it's blurry, dark, partly out of frame, or you're not certain what something is, say so briefly instead of guessing — never mention objects you aren't confident are actually present."
+            }
+            var systemContent = userSys.isEmpty ? brevity : "\(userSys)\n\n\(brevity)"
+            if let docContext { systemContent += "\n\n" + docContext }
+            var chat: [Chat.Message] = [.init(role: .system, content: systemContent)]
+            // Quarantine prior text-only vision refusals; small VLMs otherwise parrot them even
+            // when the current turn has a valid image. includeHistory=false gives fresh eyes.
+            let refusalMarkers = ["upload an image", "provide an image", "can't see the image",
+                                  "cannot see the image", "unable to see", "no image"]
+            for turn in history {
+                if visionImage != nil, turn.role == .assistant,
+                   refusalMarkers.contains(where: { turn.content.lowercased().contains($0) }) {
+                    NSLog("[OV] GemmaLocal: dropping refusal turn from vision history")
+                    continue
+                }
+                chat.append(.init(role: turn.role, content: turn.content))
+            }
+            let images: [UserInput.Image] = visionImage.map { [.ciImage($0)] } ?? []
+            chat.append(.init(role: .user, content: text, images: images))
+            // SmolVLM pre-shrinks to 512 to bound encoding; FastVLM keeps detail at native size.
+            let resize: CGSize? = (visionImage != nil && !loadedIsFastVLM)
+                ? CGSize(width: 512, height: 512) : nil
+            let userInput = UserInput(chat: chat, processing: .init(resize: resize))
             let lmInput = try await context.processor.prepare(input: userInput)
             // Cap output length — spoken aloud, so keep it to a few sentences (~30s of speech).
             let parameters = GenerateParameters(maxTokens: 170, temperature: 0.4)
@@ -873,10 +854,10 @@ final class GemmaLocalService: ObservableObject {
                 if tokenCount == 1 {
                     NSLog("[OV] GemmaLocal: first token received")
                     // Independent of any listener — see the note in cachedGenerate.
-                    await MainActor.run { MetricsCollector.shared.markFirstToken() }
+                    MetricsCollector.shared.markFirstToken()
                 }
                 let snapshot = full
-                await MainActor.run { self.onPartialResponse?(snapshot) }
+                self.onPartialResponse?(snapshot)
             case .info(let info):
                 completion = info
             default:
@@ -889,12 +870,10 @@ final class GemmaLocalService: ObservableObject {
         // yields `.info`, and no rate is better than a fabricated one — the stage timestamps are
         // still marked so the turn's breakdown stays complete.
         let stats = completion
-        await MainActor.run {
-            MetricsCollector.shared.markGenerationDone(
-                tokenCount: stats?.generationTokenCount,
-                duration: stats?.generateTime
-            )
-        }
+        MetricsCollector.shared.markGenerationDone(
+            tokenCount: stats?.generationTokenCount,
+            duration: stats?.generateTime
+        )
 
         // Release the MLX buffer cache so vision memory doesn't pile up toward the jetsam limit.
         Memory.clearCache()
@@ -903,7 +882,7 @@ final class GemmaLocalService: ObservableObject {
         if !cancelRequested && myID == generationID {
             // Remember this exchange (vision Q&A included) so in-session follow-ups have context.
             ConversationContext.shared.record(user: text, assistant: reply)
-            await MainActor.run { self.onAgentMessage?(reply) }
+            self.onAgentMessage?(reply)
         }
     }
 
@@ -927,23 +906,17 @@ final class GemmaLocalService: ObservableObject {
     func describeFrame(_ jpeg: Data, prompt: String, maxTokens: Int = 40) async throws -> String {
         guard let container = modelContainer, visionReady else { throw GemmaLocalError.modelNotLoaded }
         guard UIApplication.shared.applicationState != .background else { throw GemmaLocalError.backgrounded }
-        guard let ciImage = CIImage(data: jpeg) else { throw GemmaLocalError.badFrame }
-        // Watch frames are ALWAYS bounded to 512 — including FastVLM, which sendMessage keeps at
-        // native resolution. Native res is right when the user asked a question about detail; a
-        // one-line ambient caption doesn't need it, and encode cost scales with resolution.
-        // (Apple's own FastVLM live-captioning demo runs continuous captions with a short-output
-        // prompt rather than high-res input.)
-        let userInput = UserInput(
-            chat: [
-                // Prompt style borrowed from Apple's demo: brevity by INSTRUCTION ("about 15
-                // words") rather than only by token cap — the model plans a short sentence
-                // instead of getting truncated mid-thought.
-                .init(role: .user, content: prompt + " Output should be brief, about 15 words or less. Only describe what is clearly visible.",
-                      images: [.ciImage(ciImage)])
-            ],
-            processing: .init(resize: CGSize(width: 512, height: 512))
-        )
         let stream = try await container.perform { (context: ModelContext) in
+            guard let ciImage = CIImage(data: jpeg) else { throw GemmaLocalError.badFrame }
+            // Watch frames are always bounded to 512, including FastVLM: ambient captions do
+            // not need native resolution. Brevity instructions avoid mid-sentence truncation.
+            let userInput = UserInput(
+                chat: [
+                    .init(role: .user, content: prompt + " Output should be brief, about 15 words or less. Only describe what is clearly visible.",
+                          images: [.ciImage(ciImage)])
+                ],
+                processing: .init(resize: CGSize(width: 512, height: 512))
+            )
             let lmInput = try await context.processor.prepare(input: userInput)
             // temperature 0 (also per Apple's demo): deterministic captions mean the same scene
             // yields the same words, which is exactly what the chatter gate needs — rephrase
@@ -989,7 +962,7 @@ final class GemmaLocalService: ObservableObject {
 
         Reply ONLY as JSON: {"action":"remember|identify|forget|list|none","name":"<the person's name if they said one, otherwise empty>"}
         """
-        let messages: [Chat.Message] = [
+        let messages: [TextMessage] = [
             .init(role: .system, content: system),
             .init(role: .user, content: user)
         ]
@@ -1097,7 +1070,7 @@ final class GemmaLocalService: ObservableObject {
                     // never fired: firstTokenAt got backfilled to generation-done, collapsing
                     // generation_s to ~0 and suppressing tok/s entirely — while the same time
                     // silently inflated ttft. The measurement changed, not the work.
-                    await MainActor.run { MetricsCollector.shared.markFirstToken() }
+                    MetricsCollector.shared.markFirstToken()
                     NSLog("[OV] ttft breakdown: session→first chunk %.3fs (session %@, history seeded %@, message %d chars)",
                           Date().timeIntervalSince(genStart),
                           seededHistory ? "NEW" : "reused",
@@ -1107,7 +1080,7 @@ final class GemmaLocalService: ObservableObject {
                 full += chunk
                 if let onPartial {
                     let snapshot = full
-                    await MainActor.run { onPartial(snapshot) }
+                    onPartial(snapshot)
                 }
             case .info(let info):
                 completion = info
@@ -1117,12 +1090,10 @@ final class GemmaLocalService: ObservableObject {
         }
 
         let stats = completion
-        await MainActor.run {
-            MetricsCollector.shared.markGenerationDone(
-                tokenCount: stats?.generationTokenCount,
-                duration: stats?.generateTime
-            )
-        }
+        MetricsCollector.shared.markGenerationDone(
+            tokenCount: stats?.generationTokenCount,
+            duration: stats?.generateTime
+        )
         return full
     }
 
@@ -1173,12 +1144,12 @@ final class GemmaLocalService: ObservableObject {
 
     /// One-shot text generation used by the intent router. Optionally emits the cumulative text
     /// via `onPartial` per token so the caller can pipeline speech (Apple TTS) behind generation.
-    private func rawGenerate(messages: [Chat.Message], maxTokens: Int, temperature: Float,
+    private func rawGenerate(messages: [TextMessage], maxTokens: Int, temperature: Float,
                              onPartial: ((String) -> Void)? = nil) async throws -> String {
         guard let container = modelContainer else { throw GemmaLocalError.modelNotLoaded }
         guard UIApplication.shared.applicationState != .background else { throw GemmaLocalError.backgrounded }
-        let userInput = UserInput(chat: messages)
         let stream = try await container.perform { (context: ModelContext) in
+            let userInput = UserInput(chat: messages.map { .init(role: $0.role, content: $0.content) })
             let lmInput = try await context.processor.prepare(input: userInput)
             let params = GenerateParameters(maxTokens: maxTokens, temperature: temperature)
             return try MLXLMCommon.generate(input: lmInput, parameters: params, context: context)
@@ -1195,11 +1166,11 @@ final class GemmaLocalService: ObservableObject {
                     // NOTE: an earlier commit claimed this mark existed here; it did not — only
                     // sendMessage and cachedGenerate had it. Without it, rawGenerate turns
                     // (search answers, reformulation) backfilled firstToken to generation-done.
-                    await MainActor.run { MetricsCollector.shared.markFirstToken() }
+                    MetricsCollector.shared.markFirstToken()
                 }
                 if let onPartial {
                     let snapshot = full
-                    await MainActor.run { onPartial(snapshot) }
+                    onPartial(snapshot)
                 }
             case .info(let info):
                 completion = info
@@ -1213,12 +1184,10 @@ final class GemmaLocalService: ObservableObject {
         // so its exact stats must be reported too — the collector ACCUMULATES across passes, so
         // a route pass plus an answer pass sum into one consistent tok/s for the turn.
         let stats = completion
-        await MainActor.run {
-            MetricsCollector.shared.markGenerationDone(
-                tokenCount: stats?.generationTokenCount,
-                duration: stats?.generateTime
-            )
-        }
+        MetricsCollector.shared.markGenerationDone(
+            tokenCount: stats?.generationTokenCount,
+            duration: stats?.generateTime
+        )
         return full
     }
 
